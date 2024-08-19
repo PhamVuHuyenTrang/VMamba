@@ -12,3 +12,4 @@ MODEL:
     MLP_RATIO: 4.0
     DOWNSAMPLE: "v1"
     PATCHEMBED: "v1"
+    MoE: True
