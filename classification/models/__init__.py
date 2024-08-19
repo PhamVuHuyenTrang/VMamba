@@ -36,7 +36,6 @@ def build_vssm_model(config, **kwargs):
             downsample_version=config.MODEL.VSSM.DOWNSAMPLE,
             patchembed_version=config.MODEL.VSSM.PATCHEMBED,
             gmlp=config.MODEL.VSSM.GMLP,
-            MoE = config.MODEL.VSSM.MoE,
             use_checkpoint=config.TRAIN.USE_CHECKPOINT,
             # ===================
             posembed=config.MODEL.VSSM.POSEMBED,
