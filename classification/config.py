@@ -94,8 +94,6 @@ _C.MODEL.VSSM.NORM_LAYER = "ln"
 _C.MODEL.VSSM.DOWNSAMPLE = "v2"
 _C.MODEL.VSSM.PATCHEMBED = "v2"
 _C.MODEL.VSSM.POSEMBED = False
-_C.MODEL.VSSM.GMLP = False
-
 # -----------------------------------------------------------------------------
 # Training settings
 # -----------------------------------------------------------------------------
