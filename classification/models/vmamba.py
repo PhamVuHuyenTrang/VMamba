@@ -113,8 +113,8 @@ class Mlp(nn.Module):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
-        print("in_features", in_features)
-        print("out_features", hidden_features)
+        #print("in_features", in_features)
+        #print("out_features", hidden_features)
         Linear = Linear2d if channels_first else nn.Linear
         self.fc1 = Linear(in_features, hidden_features)
         self.act = act_layer()
@@ -122,16 +122,16 @@ class Mlp(nn.Module):
         self.drop = nn.Dropout(drop)
 
     def forward(self, x):
-        print("x_shape_before_fc1", x.shape)
+        #print("x_shape_before_fc1", x.shape)
         x = self.fc1(x)
-        print("type_fc1", type(self.fc1))
-        print("x_shape_after_fc1", x.shape)
+        #print("type_fc1", type(self.fc1))
+        #print("x_shape_after_fc1", x.shape)
         x = self.act(x)
         x = self.drop(x)
         x = self.fc2(x)
-        print("x_shape_after_fc2", x.shape)
+        #print("x_shape_after_fc2", x.shape)
         x = self.drop(x)
-        print("x_shape_after_forwarding: ", x.shape)
+        #print("x_shape_after_forwarding: ", x.shape)
         return x
     
 class MoE_vmamba(nn.Module):
@@ -140,9 +140,6 @@ class MoE_vmamba(nn.Module):
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
         
-        #print("in_features", in_features)
-        #print("out_features", hidden_features)
-        #print("hidden_size_expert", hidden_size_experts)
         # code 2D MoE
         self.fc1 = MoE(input_size=in_features, output_size=hidden_features, num_experts=10, hidden_size=hidden_size_experts, k= 2, noisy_gating=True, channel_first = channels_first)
         self.act = act_layer()
@@ -150,20 +147,17 @@ class MoE_vmamba(nn.Module):
         self.drop = nn.Dropout(drop)
         
     def forward(self, x):
-        #print("x_shape_before_reshape", x.shape)
+        loss_balancing = 0
         N, patch_1, patch_2, hidden_dim_inp = x.shape
         x = x.reshape(N * patch_1 * patch_2, hidden_dim_inp)
-        #print("x_shape_before_fc1", x.shape)
-        x, _ = self.fc1(x)
-        #print("x_shape_after_fc1", x.shape)
+        x, loss_1 = self.fc1(x)
         x = self.act(x)
         x = self.drop(x)
-        x, _ = self.fc2(x)
-        #print("x_shape_after_fc2", x.shape)
+        x, loss_2 = self.fc2(x)
         x = self.drop(x)
         x = x.reshape(N, patch_1, patch_2, hidden_dim_inp)
-        #print("x_shape_after_forwarding: ", x.shape)
-        return x
+        loss_balancing = loss_1 + loss_2
+        return x, loss_balancing
         
     
 class gMlp(nn.Module):
@@ -1222,6 +1216,15 @@ class VSSBlock(nn.Module):
         self.mlp_branch = mlp_ratio > 0
         self.use_checkpoint = use_checkpoint
         self.post_norm = post_norm
+        self.loss_balancing = 0
+        
+        if self.mlp_branch:
+            #_MLP = Mlp if not gmlp else gMlp
+            _MLP = MoE_vmamba if not gmlp else gMlp
+            self.norm2 = norm_layer(hidden_dim)
+            mlp_hidden_dim = int(hidden_dim * mlp_ratio)
+            print("hidden_dim", hidden_dim)
+            self.mlp = _MLP(in_features=hidden_dim, hidden_features=mlp_hidden_dim, act_layer=mlp_act_layer, drop=mlp_drop_rate, channels_first=channel_first)
 
         if self.ssm_branch:
             self.norm = norm_layer(hidden_dim)
@@ -1250,15 +1253,6 @@ class VSSBlock(nn.Module):
             )
         
         self.drop_path = DropPath(drop_path)
-        print("Self MLP branch: ", self.mlp_branch)
-        if self.mlp_branch:
-            #_MLP = Mlp if not gmlp else gMlp
-            _MLP = MoE_vmamba if not gmlp else gMlp
-            self.norm2 = norm_layer(hidden_dim)
-            mlp_hidden_dim = int(hidden_dim * mlp_ratio)
-            print("hidden_dim", hidden_dim)
-            self.mlp = _MLP(in_features=hidden_dim, hidden_features=mlp_hidden_dim, act_layer=mlp_act_layer, drop=mlp_drop_rate, channels_first=channel_first)
-
     def _forward(self, input: torch.Tensor):
         x = input
         if self.ssm_branch:
@@ -1268,16 +1262,25 @@ class VSSBlock(nn.Module):
                 x = x + self.drop_path(self.op(self.norm(x)))
         if self.mlp_branch:
             if self.post_norm:
-                x = x + self.drop_path(self.norm2(self.mlp(x))) # FFN
+                x_moe,load_balancing = self.mlp(x)
+                
+                x_moe = x_moe + self.drop_path(self.norm2(x_moe)) # FFN
             else:
-                x = x + self.drop_path(self.mlp(self.norm2(x))) # FFN
-        return x
+                x_moe, load_balancing = self.mlp(self.norm2(x))
+                x_moe = x_moe + self.drop_path(x_moe) # FFN
+        return x, load_balancing
 
     def forward(self, input: torch.Tensor):
         if self.use_checkpoint:
-            return checkpoint.checkpoint(self._forward, input)
+            x, loss_balancing = checkpoint.checkpoint(self._forward, input)
+            self.loss_balancing = self.loss_balancing + loss_balancing
+            return x
         else:
-            return self._forward(input)
+            x, loss_balancing = self._forward(input)
+        
+            self.loss_balancing = self.loss_balancing + loss_balancing
+            
+            return x
 
 
 class VSSM(nn.Module):
@@ -1321,6 +1324,7 @@ class VSSM(nn.Module):
         self.channel_first = (norm_layer.lower() in ["bn", "ln2d"])
         self.num_classes = num_classes
         self.num_layers = len(depths)
+        self.loss_balancing = 0
         if isinstance(dims, int):
             dims = [int(dims * 2 ** i_layer) for i_layer in range(self.num_layers)]
         self.num_features = dims[-1]
@@ -1541,6 +1545,9 @@ class VSSM(nn.Module):
             x = x + pos_embed
         for layer in self.layers:
             x = layer(x)
+            for block in layer.blocks:
+                self.loss_balancing = self.loss_balancing + block.loss_balancing
+            
         x = self.classifier(x)
         return x
 
@@ -1886,4 +1893,3 @@ if __name__ == "__main__":
     print(bench(model))
 
     breakpoint()
-
