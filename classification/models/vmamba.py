@@ -113,8 +113,6 @@ class Mlp(nn.Module):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
-        print("in_features", in_features)
-        print("out_features", hidden_features)
         Linear = Linear2d if channels_first else nn.Linear
         self.fc1 = Linear(in_features, hidden_features)
         self.act = act_layer()
@@ -122,16 +120,11 @@ class Mlp(nn.Module):
         self.drop = nn.Dropout(drop)
 
     def forward(self, x):
-        print("x_shape_before_fc1", x.shape)
         x = self.fc1(x)
-        print("type_fc1", type(self.fc1))
-        print("x_shape_after_fc1", x.shape)
         x = self.act(x)
         x = self.drop(x)
         x = self.fc2(x)
-        print("x_shape_after_fc2", x.shape)
         x = self.drop(x)
-        print("x_shape_after_forwarding: ", x.shape)
         return x
     
 class MoE_vmamba(nn.Module):
@@ -139,14 +132,9 @@ class MoE_vmamba(nn.Module):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
-        
-        #print("in_features", in_features)
-        #print("out_features", hidden_features)
-        #print("hidden_size_expert", hidden_size_experts)
-        # code 2D MoE
-        self.fc1 = MoE(input_size=in_features, output_size=hidden_features, num_experts=10, hidden_size=hidden_size_experts, k= 2, noisy_gating=True, channel_first = channels_first)
+        self.fc1 = MoE(input_size=in_features, output_size=hidden_features, num_experts=16, hidden_size=hidden_size_experts, k= 2, noisy_gating=True, channel_first = channels_first)
         self.act = act_layer()
-        self.fc2 = MoE(input_size=hidden_features, output_size=out_features, num_experts=10, hidden_size=hidden_size_experts, k= 2, noisy_gating=True, channel_first = channels_first)
+        self.fc2 = MoE(input_size=hidden_features, output_size=out_features, num_experts=16, hidden_size=hidden_size_experts, k= 2, noisy_gating=True, channel_first = channels_first)
         self.drop = nn.Dropout(drop)
         
     def forward(self, x):
@@ -1210,6 +1198,7 @@ class VSSBlock(nn.Module):
         mlp_act_layer=nn.GELU,
         mlp_drop_rate: float = 0.0,
         gmlp=False,
+        MoE=True,
         # =============================
         use_checkpoint: bool = False,
         post_norm: bool = False,
@@ -1252,8 +1241,10 @@ class VSSBlock(nn.Module):
         self.drop_path = DropPath(drop_path)
         print("Self MLP branch: ", self.mlp_branch)
         if self.mlp_branch:
-            #_MLP = Mlp if not gmlp else gMlp
-            _MLP = MoE_vmamba if not gmlp else gMlp
+            if MoE:
+                _MLP = MoE_vmamba if not gmlp else gMlp
+            else:
+                _MLP = Mlp if not gmlp else gMlp
             self.norm2 = norm_layer(hidden_dim)
             mlp_hidden_dim = int(hidden_dim * mlp_ratio)
             print("hidden_dim", hidden_dim)
@@ -1303,6 +1294,7 @@ class VSSM(nn.Module):
         mlp_act_layer="gelu",
         mlp_drop_rate=0.0,
         gmlp=False,
+        MoE=True,
         # =========================
         drop_path_rate=0.1, 
         patch_norm=True, 
@@ -1390,6 +1382,7 @@ class VSSM(nn.Module):
                 mlp_act_layer=mlp_act_layer,
                 mlp_drop_rate=mlp_drop_rate,
                 gmlp=gmlp,
+                MoE=MoE,
                 # =================
                 _SS2D=_SS2D,
             ))
@@ -1499,6 +1492,7 @@ class VSSM(nn.Module):
         mlp_act_layer=nn.GELU,
         mlp_drop_rate=0.0,
         gmlp=False,
+        MoE=True,
         # ===========================
         _SS2D=SS2D,
         **kwargs,
@@ -1525,6 +1519,7 @@ class VSSM(nn.Module):
                 mlp_act_layer=mlp_act_layer,
                 mlp_drop_rate=mlp_drop_rate,
                 gmlp=gmlp,
+                MoE=MoE,
                 use_checkpoint=use_checkpoint,
                 _SS2D=_SS2D,
             ))
@@ -1675,7 +1670,7 @@ def vanilla_vmamba_tiny():
         ssm_d_state=16, ssm_ratio=2.0, ssm_dt_rank="auto", ssm_act_layer="silu",
         ssm_conv=3, ssm_conv_bias=True, ssm_drop_rate=0.0, 
         ssm_init="v0", forward_type="v0", 
-        mlp_ratio=0.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False,
+        mlp_ratio=0.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False, MoE=True,
         patch_norm=True, norm_layer="ln", 
         downsample_version="v1", patchembed_version="v1", 
         use_checkpoint=False, posembed=False, imgsize=224, 
@@ -1689,7 +1684,7 @@ def vanilla_vmamba_small():
         ssm_d_state=16, ssm_ratio=2.0, ssm_dt_rank="auto", ssm_act_layer="silu",
         ssm_conv=3, ssm_conv_bias=True, ssm_drop_rate=0.0, 
         ssm_init="v0", forward_type="v0", 
-        mlp_ratio=0.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False,
+        mlp_ratio=0.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False, MoE = True,
         patch_norm=True, norm_layer="ln", 
         downsample_version="v1", patchembed_version="v1", 
         use_checkpoint=False, posembed=False, imgsize=224, 
@@ -1703,7 +1698,7 @@ def vanilla_vmamba_base():
         ssm_d_state=16, ssm_ratio=2.0, ssm_dt_rank="auto", ssm_act_layer="silu",
         ssm_conv=3, ssm_conv_bias=True, ssm_drop_rate=0.0, 
         ssm_init="v0", forward_type="v0", 
-        mlp_ratio=0.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False,
+        mlp_ratio=0.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False, MoE=True,
         patch_norm=True, norm_layer="ln", 
         downsample_version="v1", patchembed_version="v1", 
         use_checkpoint=False, posembed=False, imgsize=224, 
@@ -1718,7 +1713,7 @@ def vmamba_tiny_s2l5(channel_first=True):
         ssm_d_state=1, ssm_ratio=2.0, ssm_dt_rank="auto", ssm_act_layer="silu",
         ssm_conv=3, ssm_conv_bias=False, ssm_drop_rate=0.0, 
         ssm_init="v0", forward_type="v05_noz", 
-        mlp_ratio=4.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False,
+        mlp_ratio=4.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False, MoE=True,
         patch_norm=True, norm_layer=("ln2d" if channel_first else "ln"), 
         downsample_version="v3", patchembed_version="v2", 
         use_checkpoint=False, posembed=False, imgsize=224, 
@@ -1732,7 +1727,7 @@ def vmamba_small_s2l15(channel_first=True):
         ssm_d_state=1, ssm_ratio=2.0, ssm_dt_rank="auto", ssm_act_layer="silu",
         ssm_conv=3, ssm_conv_bias=False, ssm_drop_rate=0.0, 
         ssm_init="v0", forward_type="v05_noz", 
-        mlp_ratio=4.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False,
+        mlp_ratio=4.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False, MoE=True,
         patch_norm=True, norm_layer=("ln2d" if channel_first else "ln"), 
         downsample_version="v3", patchembed_version="v2", 
         use_checkpoint=False, posembed=False, imgsize=224, 
@@ -1746,7 +1741,7 @@ def vmamba_base_s2l15(channel_first=True):
         ssm_d_state=1, ssm_ratio=2.0, ssm_dt_rank="auto", ssm_act_layer="silu",
         ssm_conv=3, ssm_conv_bias=False, ssm_drop_rate=0.0, 
         ssm_init="v0", forward_type="v05_noz", 
-        mlp_ratio=4.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False,
+        mlp_ratio=4.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False,MoE=True,
         patch_norm=True, norm_layer=("ln2d" if channel_first else "ln"), 
         downsample_version="v3", patchembed_version="v2", 
         use_checkpoint=False, posembed=False, imgsize=224, 
@@ -1761,7 +1756,7 @@ def vmamba_tiny_s1l8(channel_first=True):
         ssm_d_state=1, ssm_ratio=1.0, ssm_dt_rank="auto", ssm_act_layer="silu",
         ssm_conv=3, ssm_conv_bias=False, ssm_drop_rate=0.0, 
         ssm_init="v0", forward_type="v05_noz", 
-        mlp_ratio=4.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False,
+        mlp_ratio=4.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False, MoE=True,
         patch_norm=True, norm_layer=("ln2d" if channel_first else "ln"), 
         downsample_version="v3", patchembed_version="v2", 
         use_checkpoint=False, posembed=False, imgsize=224, 
@@ -1775,7 +1770,7 @@ def vmamba_small_s1l20(channel_first=True):
         ssm_d_state=1, ssm_ratio=1.0, ssm_dt_rank="auto", ssm_act_layer="silu",
         ssm_conv=3, ssm_conv_bias=False, ssm_drop_rate=0.0, 
         ssm_init="v0", forward_type="v05_noz", 
-        mlp_ratio=4.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False,
+        mlp_ratio=4.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False, MoE=True,
         patch_norm=True, norm_layer=("ln2d" if channel_first else "ln"), 
         downsample_version="v3", patchembed_version="v2", 
         use_checkpoint=False, posembed=False, imgsize=224, 
@@ -1789,7 +1784,7 @@ def vmamba_base_s1l20(channel_first=True):
         ssm_d_state=1, ssm_ratio=1.0, ssm_dt_rank="auto", ssm_act_layer="silu",
         ssm_conv=3, ssm_conv_bias=False, ssm_drop_rate=0.0, 
         ssm_init="v0", forward_type="v05_noz", 
-        mlp_ratio=4.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False,
+        mlp_ratio=4.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False, MoE = True,
         patch_norm=True, norm_layer=("ln2d" if channel_first else "ln"), 
         downsample_version="v3", patchembed_version="v2", 
         use_checkpoint=False, posembed=False, imgsize=224, 
@@ -1805,7 +1800,7 @@ def vmamba_tiny_m2():
         ssm_d_state=64, ssm_ratio=1.0, ssm_dt_rank="auto", ssm_act_layer="gelu",
         ssm_conv=3, ssm_conv_bias=False, ssm_drop_rate=0.0, 
         ssm_init="v2", forward_type="m0_noz", 
-        mlp_ratio=4.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False,
+        mlp_ratio=4.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False, MoE=True,
         patch_norm=True, norm_layer="ln",
         downsample_version="v3", patchembed_version="v2", 
         use_checkpoint=False, posembed=False, imgsize=224, 
@@ -1819,7 +1814,7 @@ def vmamba_small_m2():
         ssm_d_state=64, ssm_ratio=1.0, ssm_dt_rank="auto", ssm_act_layer="gelu",
         ssm_conv=3, ssm_conv_bias=False, ssm_drop_rate=0.0, 
         ssm_init="v2", forward_type="m0_noz", 
-        mlp_ratio=4.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False,
+        mlp_ratio=4.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False, MoE=True,
         patch_norm=True, norm_layer="ln",
         downsample_version="v3", patchembed_version="v2", 
         use_checkpoint=False, posembed=False, imgsize=224, 
@@ -1833,7 +1828,7 @@ def vmamba_base_m2():
         ssm_d_state=64, ssm_ratio=1.0, ssm_dt_rank="auto", ssm_act_layer="gelu",
         ssm_conv=3, ssm_conv_bias=False, ssm_drop_rate=0.0, 
         ssm_init="v2", forward_type="m0_noz", 
-        mlp_ratio=4.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False,
+        mlp_ratio=4.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False, MoE=True,
         patch_norm=True, norm_layer="ln",
         downsample_version="v3", patchembed_version="v2", 
         use_checkpoint=False, posembed=False, imgsize=224, 
@@ -1849,7 +1844,7 @@ if __name__ == "__main__":
         ssm_d_state=64, ssm_ratio=1.0, ssm_dt_rank="auto", ssm_act_layer="gelu",
         ssm_conv=3, ssm_conv_bias=False, ssm_drop_rate=0.0, 
         ssm_init="v2", forward_type="m0_noz", 
-        mlp_ratio=4.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False,
+        mlp_ratio=4.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False, MoE=True,
         patch_norm=True, norm_layer="ln",
         downsample_version="v3", patchembed_version="v2", 
         use_checkpoint=False, posembed=False, imgsize=224, 
