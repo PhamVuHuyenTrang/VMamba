@@ -1,4 +1,4 @@
-# --------------------------------------------------------
+                                                        # --------------------------------------------------------
 # Modified by $@#Anonymous#@$
 # --------------------------------------------------------
 # Swin Transformer
@@ -135,7 +135,8 @@ def main(config, args):
 
 
     optimizer = build_optimizer(config, model, logger)
-    model = torch.nn.parallel.DistributedDataParallel(model, broadcast_buffers=False)
+    model = torch.nn.parallel.DistributedDataParallel(model, broadcast_buffers=False, find_unused_parameters=True)
+    model._set_static_graph()
     loss_scaler = NativeScalerWithGradNormCount()
 
     if config.TRAIN.ACCUMULATION_STEPS > 1:
@@ -224,6 +225,7 @@ def main(config, args):
 
 
 def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mixup_fn, lr_scheduler, loss_scaler, model_ema=None, model_time_warmup=50):
+    torch.autograd.set_detect_anomaly(True)
     model.train()
     optimizer.zero_grad()
 
@@ -250,6 +252,7 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
         with torch.cuda.amp.autocast(enabled=config.AMP_ENABLE):
             outputs = model(samples)
         loss = criterion(outputs, targets)
+        loss = loss+model.module.loss_balancing
         loss = loss / config.TRAIN.ACCUMULATION_STEPS
 
         # this attribute is added by timm on one optimizer (adahessian)
