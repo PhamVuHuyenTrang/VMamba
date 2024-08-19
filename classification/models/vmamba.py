@@ -5,11 +5,12 @@ import copy
 from functools import partial
 from typing import Optional, Callable, Any
 from collections import OrderedDict
-
+#from gate import *
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
+from models.moe import MoE
 from timm.models.layers import DropPath, trunc_normal_
 from fvcore.nn import FlopCountAnalysis, flop_count_str, flop_count, parameter_count
 
@@ -112,7 +113,8 @@ class Mlp(nn.Module):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
-
+        print("in_features", in_features)
+        print("out_features", hidden_features)
         Linear = Linear2d if channels_first else nn.Linear
         self.fc1 = Linear(in_features, hidden_features)
         self.act = act_layer()
@@ -120,14 +122,50 @@ class Mlp(nn.Module):
         self.drop = nn.Dropout(drop)
 
     def forward(self, x):
+        print("x_shape_before_fc1", x.shape)
         x = self.fc1(x)
+        print("type_fc1", type(self.fc1))
+        print("x_shape_after_fc1", x.shape)
         x = self.act(x)
         x = self.drop(x)
         x = self.fc2(x)
+        print("x_shape_after_fc2", x.shape)
         x = self.drop(x)
+        print("x_shape_after_forwarding: ", x.shape)
         return x
-
-
+    
+class MoE_vmamba(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0., channels_first=False, hidden_size_experts = 48):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        
+        #print("in_features", in_features)
+        #print("out_features", hidden_features)
+        #print("hidden_size_expert", hidden_size_experts)
+        # code 2D MoE
+        self.fc1 = MoE(input_size=in_features, output_size=hidden_features, num_experts=10, hidden_size=hidden_size_experts, k= 2, noisy_gating=True, channel_first = channels_first)
+        self.act = act_layer()
+        self.fc2 = MoE(input_size=hidden_features, output_size=out_features, num_experts=10, hidden_size=hidden_size_experts, k= 2, noisy_gating=True, channel_first = channels_first)
+        self.drop = nn.Dropout(drop)
+        
+    def forward(self, x):
+        #print("x_shape_before_reshape", x.shape)
+        N, patch_1, patch_2, hidden_dim_inp = x.shape
+        x = x.reshape(N * patch_1 * patch_2, hidden_dim_inp)
+        #print("x_shape_before_fc1", x.shape)
+        x, _ = self.fc1(x)
+        #print("x_shape_after_fc1", x.shape)
+        x = self.act(x)
+        x = self.drop(x)
+        x, _ = self.fc2(x)
+        #print("x_shape_after_fc2", x.shape)
+        x = self.drop(x)
+        x = x.reshape(N, patch_1, patch_2, hidden_dim_inp)
+        #print("x_shape_after_forwarding: ", x.shape)
+        return x
+        
+    
 class gMlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.,channels_first=False):
         super().__init__()
@@ -1212,11 +1250,13 @@ class VSSBlock(nn.Module):
             )
         
         self.drop_path = DropPath(drop_path)
-        
+        print("Self MLP branch: ", self.mlp_branch)
         if self.mlp_branch:
-            _MLP = Mlp if not gmlp else gMlp
+            #_MLP = Mlp if not gmlp else gMlp
+            _MLP = MoE_vmamba if not gmlp else gMlp
             self.norm2 = norm_layer(hidden_dim)
             mlp_hidden_dim = int(hidden_dim * mlp_ratio)
+            print("hidden_dim", hidden_dim)
             self.mlp = _MLP(in_features=hidden_dim, hidden_features=mlp_hidden_dim, act_layer=mlp_act_layer, drop=mlp_drop_rate, channels_first=channel_first)
 
     def _forward(self, input: torch.Tensor):
@@ -1846,5 +1886,4 @@ if __name__ == "__main__":
     print(bench(model))
 
     breakpoint()
-
 
