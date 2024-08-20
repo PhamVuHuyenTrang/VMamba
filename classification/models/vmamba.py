@@ -156,7 +156,7 @@ class MoE_vmamba(nn.Module):
         x, loss_2 = self.fc2(x)
         x = self.drop(x)
         x = x.reshape(N, patch_1, patch_2, hidden_dim_inp)
-        loss_balancing = loss_1 + loss_2
+        loss_balancing = loss_1.clone() + loss_2.clone()
         return x, loss_balancing
         
     
@@ -1216,14 +1216,13 @@ class VSSBlock(nn.Module):
         self.mlp_branch = mlp_ratio > 0
         self.use_checkpoint = use_checkpoint
         self.post_norm = post_norm
-        self.loss_balancing = 0
+        self.loss_balancing = 0.0
         
         if self.mlp_branch:
             #_MLP = Mlp if not gmlp else gMlp
             _MLP = MoE_vmamba if not gmlp else gMlp
             self.norm2 = norm_layer(hidden_dim)
             mlp_hidden_dim = int(hidden_dim * mlp_ratio)
-            print("hidden_dim", hidden_dim)
             self.mlp = _MLP(in_features=hidden_dim, hidden_features=mlp_hidden_dim, act_layer=mlp_act_layer, drop=mlp_drop_rate, channels_first=channel_first)
 
         if self.ssm_branch:
@@ -1253,34 +1252,39 @@ class VSSBlock(nn.Module):
             )
         
         self.drop_path = DropPath(drop_path)
+ 
     def _forward(self, input: torch.Tensor):
         x = input
+        
+        # Handle the SSM branch
         if self.ssm_branch:
             if self.post_norm:
                 x = x + self.drop_path(self.norm(self.op(x)))
             else:
                 x = x + self.drop_path(self.op(self.norm(x)))
+
+        # Handle the MLP branch
         if self.mlp_branch:
             if self.post_norm:
-                x_moe,load_balancing = self.mlp(x)
-                
-                x_moe = x_moe + self.drop_path(self.norm2(x_moe)) # FFN
+                x_moe, loss_balancing = self.mlp(x)
+                x_moe = x_moe + self.drop_path(self.norm2(x_moe))  # FFN
             else:
-                x_moe, load_balancing = self.mlp(self.norm2(x))
-                x_moe = x_moe + self.drop_path(x_moe) # FFN
-        return x, load_balancing
+                x_moe, loss_balancing = self.mlp(self.norm2(x))
+                x_moe = x_moe + self.drop_path(x_moe)  # FFN
+                
+            x = x_moe  # Ensure x is updated
+            self.loss_balancing = self.loss_balancing + loss_balancing.detach()  # Update loss balancing
+
+        return x
 
     def forward(self, input: torch.Tensor):
         if self.use_checkpoint:
-            x, loss_balancing = checkpoint.checkpoint(self._forward, input)
-            self.loss_balancing = self.loss_balancing + loss_balancing
-            return x
+            x = checkpoint.checkpoint(self._forward, input)
         else:
-            x, loss_balancing = self._forward(input)
+            x = self._forward(input)
         
-            self.loss_balancing = self.loss_balancing + loss_balancing
-            
-            return x
+        return x
+
 
 
 class VSSM(nn.Module):
@@ -1546,7 +1550,7 @@ class VSSM(nn.Module):
         for layer in self.layers:
             x = layer(x)
             for block in layer.blocks:
-                self.loss_balancing = self.loss_balancing + block.loss_balancing
+                self.loss_balancing = self.loss_balancing + block.loss_balancing.detach()
             
         x = self.classifier(x)
         return x
