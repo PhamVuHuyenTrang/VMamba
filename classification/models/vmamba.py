@@ -13,6 +13,7 @@ import torch.utils.checkpoint as checkpoint
 from models.moe import MoE
 from timm.models.layers import DropPath, trunc_normal_
 from fvcore.nn import FlopCountAnalysis, flop_count_str, flop_count, parameter_count
+from custom_ssm import *
 
 DropPath.__repr__ = lambda self: f"timm.DropPath({self.drop_prob})"
 # train speed is slower after enabling this opts.
@@ -141,10 +142,8 @@ class MoE_vmamba(nn.Module):
         hidden_features = hidden_features or in_features
         
         # code 2D MoE
-        self.fc1 = MoE(input_size=in_features, output_size=hidden_features, num_experts=10, hidden_size=hidden_size_experts, k= 2, noisy_gating=True, channel_first = channels_first)
-        self.act = act_layer()
-        self.fc2 = MoE(input_size=hidden_features, output_size=out_features, num_experts=10, hidden_size=hidden_size_experts, k= 2, noisy_gating=True, channel_first = channels_first)
-        self.drop = nn.Dropout(drop)
+        self.fc1 =  FMoESSMMLPOpt(num_expert=16, d_model=hidden_features, d_hidden=hidden_size_experts, activation=torch.nn.GELU(), expert_dp_comm="none", expert_rank=0, moe_top_k=2)
+        self.fc1 =  FMoESSMMLPOpt(num_expert=16, d_model=out_features, d_hidden=hidden_size_experts, activation=torch.nn.GELU(), expert_dp_comm="none", expert_rank=0, moe_top_k=2)
         
     def forward(self, x):
         loss_balancing = 0
