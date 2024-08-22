@@ -243,7 +243,7 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
         torch.cuda.reset_peak_memory_stats()
         samples = samples.cuda(non_blocking=True)
         targets = targets.cuda(non_blocking=True)
-
+        model.module.loss_balancing = torch.tensor(0.0, device=samples.device, requires_grad=True)
         if mixup_fn is not None:
             samples, targets = mixup_fn(samples, targets)
 
