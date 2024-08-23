@@ -76,12 +76,14 @@ class SelectiveScanCuda(torch.autograd.Function):
         backend = "oflex" if WITH_SELECTIVESCAN_OFLEX and (backend is None) else backend
         backend = "core" if WITH_SELECTIVESCAN_CORE and (backend is None) else backend
         backend = "mamba" if WITH_SELECTIVESCAN_MAMBA and (backend is None) else backend
+        #backend = "oflex"
         ctx.backend = backend
         if backend == "oflex":
             out, x, *rest = selective_scan_cuda_oflex.fwd(u, delta, A, B, C, D, delta_bias, delta_softplus, 1, oflex)
         elif backend == "core":
             out, x, *rest = selective_scan_cuda_core.fwd(u, delta, A, B, C, D, delta_bias, delta_softplus, 1)
         elif backend == "mamba":
+            #import selective_scan_cuda
             out, x, *rest = selective_scan_cuda.fwd(u, delta, A, B, C, D, None, delta_bias, delta_softplus)
         ctx.save_for_backward(u, delta, A, B, C, D, delta_bias, x)
         return out

@@ -1,4 +1,4 @@
-# --------------------------------------------------------
+                                                        # --------------------------------------------------------
 # Modified by $@#Anonymous#@$
 # --------------------------------------------------------
 # Swin Transformer
@@ -108,6 +108,7 @@ def main(config, args):
 
     logger.info(f"Creating model:{config.MODEL.TYPE}/{config.MODEL.NAME}")
     model = build_model(config)
+    model = model
 
     if dist.get_rank() == 0:
         if hasattr(model, 'flops'):
@@ -135,7 +136,8 @@ def main(config, args):
 
 
     optimizer = build_optimizer(config, model, logger)
-    model = torch.nn.parallel.DistributedDataParallel(model, broadcast_buffers=False)
+    model = torch.nn.parallel.DistributedDataParallel(model, broadcast_buffers=False, find_unused_parameters=True)
+    model._set_static_graph()
     loss_scaler = NativeScalerWithGradNormCount()
 
     if config.TRAIN.ACCUMULATION_STEPS > 1:
@@ -224,6 +226,7 @@ def main(config, args):
 
 
 def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mixup_fn, lr_scheduler, loss_scaler, model_ema=None, model_time_warmup=50):
+    torch.autograd.set_detect_anomaly(True)
     model.train()
     optimizer.zero_grad()
 
@@ -241,7 +244,6 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
         torch.cuda.reset_peak_memory_stats()
         samples = samples.cuda(non_blocking=True)
         targets = targets.cuda(non_blocking=True)
-
         if mixup_fn is not None:
             samples, targets = mixup_fn(samples, targets)
 

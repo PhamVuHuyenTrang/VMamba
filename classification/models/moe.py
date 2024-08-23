@@ -191,10 +191,14 @@ class MoE(nn.Module):
         """
         eps = 1e-10
         # if only num_experts = 1
+        x_float = x.float()
+        if x_float.shape[0] == 1:
+            return torch.tensor([0], device=x.device, dtype=x.dtype)  # Scalar tensor for a single element case
 
-        if x.shape[0] == 1:
-            return torch.tensor([0], device=x.device, dtype=x.dtype)
-        return x.float().var() / (x.float().mean()**2 + eps)
+        var = x_float.var()  # Calculate variance
+        mean = x_float.mean()  # Calculate mean
+        cv_squared_value = var / (mean ** 2 + eps) 
+        return cv_squared_value
 
     def _gates_to_load(self, gates):
         """Compute the true load per expert, given the gates.
@@ -290,12 +294,17 @@ class MoE(nn.Module):
         encourages all experts to be approximately equally used across a batch.
         """
         gates, load = self.noisy_top_k_gating(x, self.training)
-        # calculate importance loss
-        importance = gates.sum(0)
+        # Calculate importance and load loss without in-place operations
+        importance = gates.sum(0)  # Summing does not modify gates
+        load = load.clone()  # Ensure load is not modified in-place
+        importance_loss = self.cv_squared(importance)  # Calculate CV squared for importance
+        load_loss = self.cv_squared(load)  # Calculate CV squared for load
+        loss = importance_loss + load_loss
+        loss = loss * loss_coef  # Scalar multiplication
 
         dispatcher = SparseDispatcher(self.num_experts, gates)
         expert_inputs = dispatcher.dispatch(x)
         gates = dispatcher.expert_to_gates()
         expert_outputs = [self.experts[i](expert_inputs[i]) for i in range(self.num_experts)]
         y = dispatcher.combine(expert_outputs)
-        return y
+        return y, loss

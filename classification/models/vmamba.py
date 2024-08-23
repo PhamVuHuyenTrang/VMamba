@@ -13,7 +13,9 @@ import torch.utils.checkpoint as checkpoint
 from models.moe import MoE
 from timm.models.layers import DropPath, trunc_normal_
 from fvcore.nn import FlopCountAnalysis, flop_count_str, flop_count, parameter_count
-
+from models.custom_ssm import *
+from models.moe_cuda import *
+from models.custom_gates import *
 DropPath.__repr__ = lambda self: f"timm.DropPath({self.drop_prob})"
 # train speed is slower after enabling this opts.
 # torch.backends.cudnn.enabled = True
@@ -139,25 +141,31 @@ class MoE_vmamba(nn.Module):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
-        
         # code 2D MoE
-        self.fc1 = MoE(input_size=in_features, output_size=hidden_features, num_experts=10, hidden_size=hidden_size_experts, k= 2, noisy_gating=True, channel_first = channels_first)
+        self.fc1 = CustomizedMoEPositionwiseFF(gate=CustomNaiveGate_Balance_SMoE, hidden_size=hidden_features, inner_hidden_size=hidden_size_experts, dropout=0.2)
+        self.fc2 = CustomizedMoEPositionwiseFF(gate=CustomNaiveGate_Balance_SMoE, hidden_size=out_features, inner_hidden_size=hidden_size_experts, dropout=0.2)
         self.act = act_layer()
-        self.fc2 = MoE(input_size=hidden_features, output_size=out_features, num_experts=10, hidden_size=hidden_size_experts, k= 2, noisy_gating=True, channel_first = channels_first)
         self.drop = nn.Dropout(drop)
-        
     def forward(self, x):
-        loss_balancing = 0
-        N, patch_1, patch_2, hidden_dim_inp = x.shape
-        x = x.reshape(N * patch_1 * patch_2, hidden_dim_inp)
-        x, loss_1 = self.fc1(x)
+        x = x
+        #loss_balancing = 0
+        N, W, H, hidden_dim_inp = x.shape
+       #import pdb; pdb.set_trace()
+        x = torch.permute(x, (0, 3, 1,2))
+        x = x.reshape(N, hidden_dim_inp, W * H)
+        x = torch.permute(x, (0, 2, 1))
+        #import pdb; pdb.set_trace()
+        x = self.fc1(x)
         x = self.act(x)
         x = self.drop(x)
-        x, loss_2 = self.fc2(x)
+        x = self.fc2(x)
         x = self.drop(x)
-        x = x.reshape(N, patch_1, patch_2, hidden_dim_inp)
-        loss_balancing = loss_1.clone() + loss_2.clone()
-        return x, loss_balancing
+        x = torch.permute(x, (0,2,1))
+        x = x.reshape(N, hidden_dim_inp, W, H)
+        x = torch.permute(x, (0,2,3,1))
+        #x = x.reshape(N, W, H, hidden_dim_inp)
+        #loss_balancing = loss_1.clone() + loss_2.clone()
+        return x
         
     
 class gMlp(nn.Module):
@@ -338,6 +346,7 @@ class SS2Dv0:
         x = self.in_proj(x)
         x, z = x.chunk(2, dim=-1) # (b, h, w, d)
         z = self.act(z)
+        #import pdb;pdb.set_trace()
         x = x.permute(0, 3, 1, 2).contiguous()
         x = self.conv2d(x) # (b, d, h, w)
         x = self.act(x)
@@ -399,7 +408,7 @@ class SS2Dv0:
         y = out_y[:, 0] + inv_y[:, 0] + wh_y + invwh_y
         
         y = y.transpose(dim0=1, dim1=2).contiguous() # (B, L, C)
-        y = self.out_norm(y).view(B, H, W, -1)
+        y = self.out_norm(y.float()).view(B, H, W, -1)
 
         y = y * z
         out = self.dropout(self.out_proj(y))
@@ -1216,7 +1225,7 @@ class VSSBlock(nn.Module):
         self.mlp_branch = mlp_ratio > 0
         self.use_checkpoint = use_checkpoint
         self.post_norm = post_norm
-        self.loss_balancing = 0.0
+        #self.loss_balancing = 0.0
         
         if self.ssm_branch:
             self.norm = norm_layer(hidden_dim)
@@ -1266,14 +1275,16 @@ class VSSBlock(nn.Module):
         # Handle the MLP branch
         if self.mlp_branch:
             if self.post_norm:
-                x_moe, loss_balancing = self.mlp(x)
-                x_moe = x_moe + self.drop_path(self.norm2(x_moe))  # FFN
+                x_moe = self.mlp(x)
+                x_moe = x_moe + self.drop_path(x_moe)
+                
             else:
-                x_moe, loss_balancing = self.mlp(self.norm2(x))
+               #x_moe = self.mlp(self.norm2(x))
+                x_moe = self.mlp(x)
                 x_moe = x_moe + self.drop_path(x_moe)  # FFN
                 
             x = x_moe  # Ensure x is updated
-            self.loss_balancing = self.loss_balancing + loss_balancing.detach()  # Update loss balancing
+            #self.loss_balancing = self.loss_balancing + loss_balancing.detach()  # Update loss balancing
 
         return x
 
@@ -1328,7 +1339,7 @@ class VSSM(nn.Module):
         self.channel_first = (norm_layer.lower() in ["bn", "ln2d"])
         self.num_classes = num_classes
         self.num_layers = len(depths)
-        self.loss_balancing = 0
+        #self.loss_balancing = 0
         if isinstance(dims, int):
             dims = [int(dims * 2 ** i_layer) for i_layer in range(self.num_layers)]
         self.num_features = dims[-1]
@@ -1549,8 +1560,6 @@ class VSSM(nn.Module):
             x = x + pos_embed
         for layer in self.layers:
             x = layer(x)
-            for block in layer.blocks:
-                self.loss_balancing = self.loss_balancing + block.loss_balancing.detach()
             
         x = self.classifier(x)
         return x
@@ -1656,6 +1665,7 @@ class Backbone_VSSM(VSSM):
             print(f"Failed loading checkpoint form {ckpt}: {e}")
 
     def forward(self, x):
+        x = x
         def layer_forward(l, x):
             x = l.blocks(x)
             y = l.downsample(x)

@@ -55,9 +55,9 @@ _C.MODEL.TYPE = 'vssm'
 _C.MODEL.NAME = 'vssm_tiny_224'
 # Pretrained weight from checkpoint, could be imagenet22k pretrained weight
 # could be overwritten by command line argument
-_C.MODEL.PRETRAINED = ''
+_C.MODEL.PRETRAINED = False
 # Checkpoint to resume, could be overwritten by command line argument
-_C.MODEL.RESUME = ''
+_C.MODEL.RESUME = False
 # Number of classes, overwritten in data preparation
 _C.MODEL.NUM_CLASSES = 1000
 # Dropout rate
@@ -95,7 +95,6 @@ _C.MODEL.VSSM.DOWNSAMPLE = "v2"
 _C.MODEL.VSSM.PATCHEMBED = "v2"
 _C.MODEL.VSSM.POSEMBED = False
 _C.MODEL.VSSM.GMLP = False
-_C.MODEL.VSSM.MoE = False
 
 # -----------------------------------------------------------------------------
 # Training settings

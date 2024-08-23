@@ -27,10 +27,10 @@ class CHECKS:
 
         # test 1 True =================================
         torch.manual_seed(time.time()); torch.cuda.manual_seed(time.time())
-        oldvss = VMamba2Dp(depths=[2,2,6,2]).half().cuda()
-        newvss = VSSM(depths=[2,2,6,2]).half().cuda()
+        oldvss = VMamba2Dp(depths=[2,2,6,2]).cuda()
+        newvss = VSSM(depths=[2,2,6,2]).cuda()
         newvss.load_state_dict(oldvss.state_dict())
-        input = torch.randn((12, 3, 224, 224)).half().cuda()
+        input = torch.randn((12, 3, 224, 224)).cuda()
         torch.cuda.manual_seed(0)
         with torch.cuda.amp.autocast():
             y1 = oldvss.forward_backbone(input)
@@ -118,10 +118,10 @@ class CHECKS:
 
         # test 1 True =================================
         torch.manual_seed(time.time()); torch.cuda.manual_seed(time.time())
-        oldvss = VSSM0(depths=[2,2,6,2]).half().cuda()
-        newvss = VSSM1(depths=[2,2,6,2]).half().cuda()
+        oldvss = VSSM0(depths=[2,2,6,2]).cuda()
+        newvss = VSSM1(depths=[2,2,6,2]).cuda()
         newvss.load_state_dict(oldvss.state_dict())
-        input = torch.randn((12, 3, 224, 224)).half().cuda()
+        input = torch.randn((12, 3, 224, 224)).cuda()
         torch.manual_seed(0); torch.cuda.manual_seed(0)
         with torch.cuda.amp.autocast():
             y1 = oldvss.forward_backbone(input)
@@ -165,10 +165,10 @@ class CHECKS:
 
         # test 1 True =================================
         torch.manual_seed(time.time()); torch.cuda.manual_seed(time.time())
-        oldvss = VSSM0(depths=[2,2,6,2]).half().cuda()
-        newvss = VSSM1(depths=[2,2,6,2]).half().cuda()
+        oldvss = VSSM0(depths=[2,2,6,2]).cuda()
+        newvss = VSSM1(depths=[2,2,6,2]).cuda()
         newvss.load_state_dict(oldvss.state_dict())
-        input0 = torch.randn((12, 3, 224, 224)).half().cuda().requires_grad_()
+        input0 = torch.randn((12, 3, 224, 224)).cuda().requires_grad_()
         input1 = input0.detach().clone().requires_grad_()
         torch.manual_seed(0); torch.cuda.manual_seed(0)
         with torch.cuda.amp.autocast():
@@ -456,7 +456,7 @@ class CHECKS:
 
     def check_channel_first():
         import triton
-        inp = torch.randn((64, 3, 224, 224)).cuda().half().requires_grad_()
+        inp = torch.randn((64, 3, 224, 224)).cuda().requires_grad_()
         inp2 = inp.detach().clone().requires_grad_()
 
         torch.manual_seed(0); torch.cuda.manual_seed(0)
@@ -482,8 +482,8 @@ class CHECKS:
         print(ms1, ms2, ms3, ms4)
 
     def check_profile():
-        vss = VSSM(depths=[1], dims=1024).half().cuda()
-        input = torch.randn((128, 3, 56, 56)).half().cuda()
+        vss = VSSM(depths=[1], dims=1024).cuda()
+        input = torch.randn((128, 3, 56, 56)).cuda()
         torch.cuda.manual_seed(0)
 
         def trace_handler(prof: torch.profiler.profile):

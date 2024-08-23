@@ -36,7 +36,6 @@ def build_vssm_model(config, **kwargs):
             downsample_version=config.MODEL.VSSM.DOWNSAMPLE,
             patchembed_version=config.MODEL.VSSM.PATCHEMBED,
             gmlp=config.MODEL.VSSM.GMLP,
-            MoE = config.MODEL.VSSM.MoE,
             use_checkpoint=config.TRAIN.USE_CHECKPOINT,
             # ===================
             posembed=config.MODEL.VSSM.POSEMBED,
@@ -50,6 +49,7 @@ def build_vssm_model(config, **kwargs):
 def build_model(config, is_pretrain=False):
     model = None
     if model is None:
+        print("build_vssm_model")
         model = build_vssm_model(config)
     if model is None:
         from .simvmamba import simple_build
