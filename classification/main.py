@@ -426,7 +426,7 @@ if __name__ == '__main__':
 
     # print config
     logger.info(config.dump())
-    logger.info(json.dumps(vars(args)))
+    #logger.info(json.dumps(vars(args)))
 
     if args.memory_limit_rate > 0 and args.memory_limit_rate < 1:
         torch.cuda.set_per_process_memory_fraction(args.memory_limit_rate)
