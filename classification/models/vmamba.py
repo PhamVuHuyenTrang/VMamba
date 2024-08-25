@@ -147,7 +147,6 @@ class MoE_vmamba(nn.Module):
         self.act = act_layer()
         self.drop = nn.Dropout(drop)
     def forward(self, x):
-        x = x
         #loss_balancing = 0
         N, W, H, hidden_dim_inp = x.shape
        #import pdb; pdb.set_trace()
