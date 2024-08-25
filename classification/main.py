@@ -101,22 +101,19 @@ def _torch_distributed_init_process_group(local_rank):
 
 def set_up_env(args):
     assert torch.cuda.is_available()
-    if dist.is_available() and dist.is_initialized():
-        env_params = _torch_distributed_init_process_group(local_rank=args.local_rank)
-        args.rank = env_params["rank"]
-        args.world_size = env_params["world_size"]
+    env_params = _torch_distributed_init_process_group(local_rank=args.local_rank)
+    args.rank = env_params["rank"]
+    args.world_size = env_params["world_size"]
     args.device = torch.device("cuda")
 
 
 def main(config, args):
-    set_up_env(args)  # Set up distributed environment
-
     dataset_train, dataset_val, data_loader_train, data_loader_val, mixup_fn = build_loader(config)
 
-    logger.info(f"Creating model: {config.MODEL.TYPE}/{config.MODEL.NAME}")
+    logger.info(f"Creating model:{config.MODEL.TYPE}/{config.MODEL.NAME}")
     model = build_model(config)
 
-    if args.rank == 0:
+    if dist.get_rank() == 0:
         if hasattr(model, 'flops'):
             logger.info(str(model))
             n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -125,7 +122,6 @@ def main(config, args):
             logger.info(f"number of GFLOPs: {flops / 1e9}")
         else:
             logger.info(flop_count_str(FlopCountAnalysis(model, (dataset_val[0][0][None],))))
-
     torch.cuda.empty_cache()
     dist.barrier()
     model.cuda()
@@ -133,16 +129,17 @@ def main(config, args):
 
     model_ema = None
     if args.model_ema:
+        # Important to create EMA model after cuda(), DP wrapper, and AMP but before SyncBN and DDP wrapper
         model_ema = ModelEma(
             model,
             decay=args.model_ema_decay,
             device='cpu' if args.model_ema_force_cpu else '',
-            resume=''
-        )
-        print(f"Using EMA with decay = {args.model_ema_decay:.8f}")
+            resume='')
+        print("Using EMA with decay = %.8f" % args.model_ema_decay)
+
 
     optimizer = build_optimizer(config, model, logger)
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank], output_device=args.local_rank, broadcast_buffers=False)
+    model = torch.nn.parallel.DistributedDataParallel(model, broadcast_buffers=False)
     loss_scaler = NativeScalerWithGradNormCount()
 
     if config.TRAIN.ACCUMULATION_STEPS > 1:
@@ -151,6 +148,7 @@ def main(config, args):
         lr_scheduler = build_scheduler(config, optimizer, len(data_loader_train))
 
     if config.AUG.MIXUP > 0.:
+        # smoothing is handled with mixup label transform
         criterion = SoftTargetCrossEntropy()
     elif config.MODEL.LABEL_SMOOTHING > 0.:
         criterion = LabelSmoothingCrossEntropy(smoothing=config.MODEL.LABEL_SMOOTHING)
@@ -194,39 +192,49 @@ def main(config, args):
         if config.EVAL_MODE:
             return
 
-    if config.THROUGHPUT_MODE and (args.rank == 0):
+    if config.THROUGHPUT_MODE and (dist.get_rank() == 0):
         logger.info(f"throughput mode ==============================")
         throughput(data_loader_val, model, logger)
+        if model_ema is not None:
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            throughput(data_loader_val, model_ema.ema, logger)
         return
 
+
+    logger.info("Start training")
     start_time = time.time()
     for epoch in range(config.TRAIN.START_EPOCH, config.TRAIN.EPOCHS):
         data_loader_train.sampler.set_epoch(epoch)
-        train_one_epoch(config, model, criterion, data_loader_train, optimizer, epoch, mixup_fn, lr_scheduler, loss_scaler, logger, model_ema)
-        if dist.get_rank() == 0:
-            save_checkpoint_ema(config, epoch, model_without_ddp, max_accuracy, optimizer, lr_scheduler, loss_scaler, logger, model_ema)
+
+        train_one_epoch(config, model, criterion, data_loader_train, optimizer, epoch, mixup_fn, lr_scheduler, loss_scaler, model_ema)
+        if dist.get_rank() == 0 and (epoch % config.SAVE_FREQ == 0 or epoch == (config.TRAIN.EPOCHS - 1)):
+            save_checkpoint_ema(config, epoch, model_without_ddp, max_accuracy, optimizer, lr_scheduler, loss_scaler, logger, model_ema, max_accuracy_ema)
 
         acc1, acc5, loss = validate(config, data_loader_val, model)
         logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
+        max_accuracy = max(max_accuracy, acc1)
+        logger.info(f'Max accuracy: {max_accuracy:.2f}%')
         if model_ema is not None:
             acc1_ema, acc5_ema, loss_ema = validate(config, data_loader_val, model_ema.ema)
-            logger.info(f"Accuracy of the network ema on the {len(dataset_val)} test images: {acc1_ema:.1f}%")
-
-        max_accuracy = max(max_accuracy, acc1)
-        if model_ema is not None:
+            logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1_ema:.1f}%")
             max_accuracy_ema = max(max_accuracy_ema, acc1_ema)
-        logger.info(f'Max accuracy: {max_accuracy:.2f}%')
-        logger.info(f'Max accuracy ema: {max_accuracy_ema:.2f}%')
+            logger.info(f'Max accuracy ema: {max_accuracy_ema:.2f}%')
+
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    logger.info(f'Training time {total_time_str}')
+    logger.info('Training time {}'.format(total_time_str))
 
-def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mixup_fn, lr_scheduler, loss_scaler, logger, model_ema=None):
+
+def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mixup_fn, lr_scheduler, loss_scaler, model_ema=None, model_time_warmup=50):
     model.train()
     optimizer.zero_grad()
+
     num_steps = len(data_loader)
     batch_time = AverageMeter()
+    model_time = AverageMeter()
+    data_time = AverageMeter()
     loss_meter = AverageMeter()
     norm_meter = AverageMeter()
     scaler_meter = AverageMeter()
@@ -234,52 +242,66 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
     start = time.time()
     end = time.time()
     for idx, (samples, targets) in enumerate(data_loader):
+        torch.cuda.reset_peak_memory_stats()
         samples = samples.cuda(non_blocking=True)
         targets = targets.cuda(non_blocking=True)
+
         if mixup_fn is not None:
             samples, targets = mixup_fn(samples, targets)
 
-        with torch.cuda.amp.autocast(enabled=config.AMP):
-            outputs = model(samples)
-            loss = criterion(outputs, targets)
+        data_time.update(time.time() - end)
 
-        loss_scaler(loss, optimizer, clip_grad=config.TRAIN.CLIP_GRAD, parameters=model.parameters(), create_graph=config.TRAIN.ACCUMULATION_STEPS > 1)
+        with torch.cuda.amp.autocast(enabled=config.AMP_ENABLE):
+            outputs = model(samples)
+        loss = criterion(outputs, targets)
+        loss = loss / config.TRAIN.ACCUMULATION_STEPS
+
+        # this attribute is added by timm on one optimizer (adahessian)
+        is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
+        grad_norm = loss_scaler(loss, optimizer, clip_grad=config.TRAIN.CLIP_GRAD,
+                                parameters=model.parameters(), create_graph=is_second_order,
+                                update_grad=(idx + 1) % config.TRAIN.ACCUMULATION_STEPS == 0)
         if (idx + 1) % config.TRAIN.ACCUMULATION_STEPS == 0:
             optimizer.zero_grad()
-            lr_scheduler.step_update(epoch * num_steps + idx)
-            torch.cuda.empty_cache()
+            lr_scheduler.step_update((epoch * num_steps + idx) // config.TRAIN.ACCUMULATION_STEPS)
+            if model_ema is not None:
+                model_ema.update(model)
+        loss_scale_value = loss_scaler.state_dict()["scale"]
 
         torch.cuda.synchronize()
 
-        if model_ema is not None:
-            model_ema.update(model)
-
         loss_meter.update(loss.item(), targets.size(0))
-        norm_meter.update(loss_scaler.state_dict()["grad_norm"])
-        scaler_meter.update(loss_scaler.state_dict()["scaler"])
+        if grad_norm is not None:  # loss_scaler return None if not update
+            norm_meter.update(grad_norm)
+        scaler_meter.update(loss_scale_value)
         batch_time.update(time.time() - end)
         end = time.time()
 
+        if idx > model_time_warmup:
+            model_time.update(batch_time.val - data_time.val)
+
         if idx % config.PRINT_FREQ == 0:
-            lr = optimizer.param_groups[0]["lr"]
+            lr = optimizer.param_groups[0]['lr']
+            wd = optimizer.param_groups[0]['weight_decay']
             memory_used = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
+            etas = batch_time.avg * (num_steps - idx)
             logger.info(
                 f'Train: [{epoch}/{config.TRAIN.EPOCHS}][{idx}/{num_steps}]\t'
-                f'eta {datetime.timedelta(seconds=int(batch_time.avg * (num_steps - idx)))} lr {lr:.6f}\t'
+                f'eta {datetime.timedelta(seconds=int(etas))} lr {lr:.6f}\t wd {wd:.4f}\t'
                 f'time {batch_time.val:.4f} ({batch_time.avg:.4f})\t'
+                f'data time {data_time.val:.4f} ({data_time.avg:.4f})\t'
+                f'model time {model_time.val:.4f} ({model_time.avg:.4f})\t'
                 f'loss {loss_meter.val:.4f} ({loss_meter.avg:.4f})\t'
                 f'grad_norm {norm_meter.val:.4f} ({norm_meter.avg:.4f})\t'
-                f'scaler {scaler_meter.val:.4f} ({scaler_meter.avg:.4f})\t'
-                f'mem {memory_used:.0f}MB'
-            )
-
+                f'loss_scale {scaler_meter.val:.4f} ({scaler_meter.avg:.4f})\t'
+                f'mem {memory_used:.0f}MB')
     epoch_time = time.time() - start
     logger.info(f"EPOCH {epoch} training takes {datetime.timedelta(seconds=int(epoch_time))}")
+
 
 @torch.no_grad()
 def validate(config, data_loader, model):
     criterion = torch.nn.CrossEntropyLoss()
-
     model.eval()
 
     batch_time = AverageMeter()
@@ -292,35 +314,123 @@ def validate(config, data_loader, model):
         images = images.cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)
 
-        with torch.cuda.amp.autocast(enabled=config.AMP):
+        # compute output
+        with torch.cuda.amp.autocast(enabled=config.AMP_ENABLE):
             output = model(images)
-        loss = criterion(output, target)
 
+        # measure accuracy and record loss
+        loss = criterion(output, target)
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
+
+        acc1 = reduce_tensor(acc1)
+        acc5 = reduce_tensor(acc5)
+        loss = reduce_tensor(loss)
 
         loss_meter.update(loss.item(), target.size(0))
         acc1_meter.update(acc1.item(), target.size(0))
         acc5_meter.update(acc5.item(), target.size(0))
 
+        # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
 
+        if idx % config.PRINT_FREQ == 0:
+            memory_used = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
+            logger.info(
+                f'Test: [{idx}/{len(data_loader)}]\t'
+                f'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                f'Loss {loss_meter.val:.4f} ({loss_meter.avg:.4f})\t'
+                f'Acc@1 {acc1_meter.val:.3f} ({acc1_meter.avg:.3f})\t'
+                f'Acc@5 {acc5_meter.val:.3f} ({acc5_meter.avg:.3f})\t'
+                f'Mem {memory_used:.0f}MB')
     logger.info(f' * Acc@1 {acc1_meter.avg:.3f} Acc@5 {acc5_meter.avg:.3f}')
     return acc1_meter.avg, acc5_meter.avg, loss_meter.avg
 
 
+@torch.no_grad()
+def throughput(data_loader, model, logger):
+    model.eval()
+
+    for idx, (images, _) in enumerate(data_loader):
+        images = images.cuda(non_blocking=True)
+        batch_size = images.shape[0]
+        for i in range(50):
+            model(images)
+        torch.cuda.synchronize()
+        logger.info(f"throughput averaged with 30 times")
+        tic1 = time.time()
+        for i in range(30):
+            model(images)
+        torch.cuda.synchronize()
+        tic2 = time.time()
+        logger.info(f"batch_size {batch_size} throughput {30 * batch_size / (tic2 - tic1)}")
+        return
+
+
 if __name__ == '__main__':
     args, config = parse_option()
+    set_up_env(args)
+    if config.AMP_OPT_LEVEL:
+        print("[warning] Apex amp has been deprecated, please use pytorch amp instead!")
 
+    torch.cuda.set_device(args.rank)
+    dist.barrier()
+
+    seed = config.SEED + dist.get_rank()
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    cudnn.benchmark = True
+
+    if True: 
+        torch.backends.cudnn.enabled = True
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = True
+
+    # linear scale the learning rate according to total batch size, may not be optimal
+    linear_scaled_lr = config.TRAIN.BASE_LR * config.DATA.BATCH_SIZE * dist.get_world_size() / 512.0
+    linear_scaled_warmup_lr = config.TRAIN.WARMUP_LR * config.DATA.BATCH_SIZE * dist.get_world_size() / 512.0
+    linear_scaled_min_lr = config.TRAIN.MIN_LR * config.DATA.BATCH_SIZE * dist.get_world_size() / 512.0
+    # gradient accumulation also need to scale the learning rate
+    if config.TRAIN.ACCUMULATION_STEPS > 1:
+        linear_scaled_lr = linear_scaled_lr * config.TRAIN.ACCUMULATION_STEPS
+        linear_scaled_warmup_lr = linear_scaled_warmup_lr * config.TRAIN.ACCUMULATION_STEPS
+        linear_scaled_min_lr = linear_scaled_min_lr * config.TRAIN.ACCUMULATION_STEPS
+    config.defrost()
+    config.TRAIN.BASE_LR = linear_scaled_lr
+    config.TRAIN.WARMUP_LR = linear_scaled_warmup_lr
+    config.TRAIN.MIN_LR = linear_scaled_min_lr
+    config.freeze()
+
+    # to make sure all the config.OUTPUT are the same
+    config.defrost()
+    if dist.get_rank() == 0:
+        obj = [config.OUTPUT]
+        # obj = [str(random.randint(0, 100))] # for test
+    else:
+        obj = [None]
+    dist.broadcast_object_list(obj)
+    dist.barrier()
+    config.OUTPUT = obj[0]
+    print(config.OUTPUT, flush=True)
+    config.freeze()
     os.makedirs(config.OUTPUT, exist_ok=True)
+    logger = create_logger(output_dir=config.OUTPUT, dist_rank=dist.get_rank(), name=f"{config.MODEL.NAME}")
 
-    logger = create_logger(output_dir=config.OUTPUT, dist_rank=args.rank, name=f"{config.MODEL.NAME}")
+    if dist.get_rank() == 0:
+        path = os.path.join(config.OUTPUT, "config.json")
+        with open(path, "w") as f:
+            f.write(config.dump())
+        logger.info(f"Full config saved to {path}")
 
-    path = os.path.join(config.OUTPUT, "config.json")
-    with open(path, "w") as f:
-        f.write(config.dump())
-    logger.info(f"Full config saved to {path}")
-
+    # print config
     logger.info(config.dump())
+    logger.info(json.dumps(vars(args)))
+
+    if args.memory_limit_rate > 0 and args.memory_limit_rate < 1:
+        torch.cuda.set_per_process_memory_fraction(args.memory_limit_rate)
+        usable_memory = torch.cuda.get_device_properties(0).total_memory * args.memory_limit_rate / 1e6
+        print(f"===========> GPU memory is limited to {usable_memory}MB", flush=True)
 
     main(config, args)
