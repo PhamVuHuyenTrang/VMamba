@@ -125,6 +125,7 @@ class Mlp(nn.Module):
 
     def forward(self, x):
         #print("x_shape_before_fc1", x.shape)
+        import pdb; pdb.set_trace()
         x = self.fc1(x)
         #print("type_fc1", type(self.fc1))
         #print("x_shape_after_fc1", x.shape)
@@ -137,28 +138,28 @@ class Mlp(nn.Module):
         return x
     
 class MoE_vmamba(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0., channels_first=False, hidden_size_experts = 48):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0., channels_first=False, hidden_size_experts = 384):
         super().__init__()
+        #import pdb; pdb.set_trace()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
         # code 2D MoE
-        self.fc1 = CustomizedMoEPositionwiseFF(gate=CustomNaiveGate_Balance_SMoE, hidden_size=hidden_features, inner_hidden_size=hidden_size_experts, dropout=0.2)
-        self.fc2 = CustomizedMoEPositionwiseFF(gate=CustomNaiveGate_Balance_SMoE, hidden_size=out_features, inner_hidden_size=hidden_size_experts, dropout=0.2)
+        self.fc1 = CustomizedMoEPositionwiseFF(gate=CustomNaiveGate_Balance_SMoE, hidden_size=in_features, inner_hidden_size=hidden_size_experts, dropout=0.2)
+        #self.fc2 = CustomizedMoEPositionwiseFF(gate=CustomNaiveGate_Balance_SMoE, hidden_size=96, inner_hidden_size=hidden_size_experts, dropout=0.2)
         self.act = act_layer()
         self.drop = nn.Dropout(drop)
     def forward(self, x):
         #loss_balancing = 0
         N, W, H, hidden_dim_inp = x.shape
-       #import pdb; pdb.set_trace()
-        x = torch.permute(x, (0, 3, 1,2))
+        #import pdb; pdb.set_trace()
+        x = torch.permute(x, (0, 3, 1, 2))
         x = x.reshape(N, hidden_dim_inp, W * H)
         x = torch.permute(x, (0, 2, 1))
-        #import pdb; pdb.set_trace()
         x = self.fc1(x)
         x = self.act(x)
         x = self.drop(x)
-        x = self.fc2(x)
-        x = self.drop(x)
+        #x = self.fc2(x)
+        #x = self.drop(x)
         x = torch.permute(x, (0,2,1))
         x = x.reshape(N, hidden_dim_inp, W, H)
         x = torch.permute(x, (0,2,3,1))
@@ -1275,11 +1276,11 @@ class VSSBlock(nn.Module):
         if self.mlp_branch:
             if self.post_norm:
                 x_moe = self.mlp(x)
-                x_moe = x_moe + self.drop_path(x_moe)
+                x_moe = x_moe + self.drop_path(self.norm2(x_moe))
                 
             else:
                #x_moe = self.mlp(self.norm2(x))
-                x_moe = self.mlp(x)
+                x_moe = self.mlp(self.norm2(x))
                 x_moe = x_moe + self.drop_path(x_moe)  # FFN
                 
             x = x_moe  # Ensure x is updated
