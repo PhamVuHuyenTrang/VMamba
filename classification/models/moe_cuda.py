@@ -153,7 +153,7 @@ class CustomizedMoEPositionwiseFF(FMoESSMMLP):
         inner_hidden_size,
         dropout,
         pre_lnorm=False,
-        moe_num_expert=16,
+        moe_num_expert=8,
         moe_top_k=2,
     ):
         activation = nn.Sequential(nn.ReLU(), nn.Dropout(dropout))
@@ -185,7 +185,7 @@ class CustomizedMoEPositionwiseFF(FMoESSMMLP):
             ##### residual connection + layer normalization
             #import pdb;pdb.set_trace()
             #output = self.layer_norm(inp + core_out)
-            output = inp + core_out
+            output = self.layer_norm(inp + core_out)
         return output
 
 
