@@ -17,7 +17,7 @@ __all__ = [
 
 
 class CustomNaiveGate_Balance_SMoE(BaseGate):
-    def __init__(self, d_model, num_expert, world_size, top_k=2, g_blance=False):
+    def __init__(self, d_model, num_expert, world_size, top_k=2, g_blance=True):
         super().__init__(num_expert, world_size)
         self.gate = nn.Linear(d_model, self.tot_expert)
         self.top_k = top_k
@@ -69,7 +69,7 @@ class CustomNaiveGate_Balance_SMoE(BaseGate):
 
 
 class CustomNaiveGate_Balance_XMoE(BaseGate):
-    def __init__(self, d_model, num_expert, world_size, top_k=2, g_balance=False):
+    def __init__(self, d_model, num_expert, world_size, top_k=2, g_balance=True):
         super().__init__(num_expert, world_size)
         self.gate = nn.Linear(d_model, self.tot_expert)
         self.top_k = top_k
@@ -157,7 +157,7 @@ class CustomNaiveGate_Balance_StableMoE(BaseGate):
     Naive Gate StableMoE
     """
 
-    def __init__(self, d_model, num_expert, world_size, top_k=2, g_balance=False):
+    def __init__(self, d_model, num_expert, world_size, top_k=2, g_balance=True):
         super().__init__(num_expert, world_size)
         self.top_k = top_k
         self.dense_moe_flag = False
