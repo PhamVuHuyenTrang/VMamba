@@ -1,4 +1,4 @@
-# --------------------------------------------------------
+                                                        # --------------------------------------------------------
 # Modified by $@#Anonymous#@$
 # --------------------------------------------------------
 # Swin Transformer
@@ -19,6 +19,7 @@ import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
+from models.custom_gates import *
 
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from timm.utils import accuracy, AverageMeter
@@ -29,7 +30,7 @@ from data import build_loader
 from utils.lr_scheduler import build_scheduler
 from utils.optimizer import build_optimizer
 from utils.logger import create_logger
-from utils.utils import NativeScalerWithGradNormCount, auto_resume_helper, reduce_tensor
+from utils.utils import  NativeScalerWithGradNormCount, auto_resume_helper, reduce_tensor
 from utils.utils import load_checkpoint_ema, load_pretrained_ema, save_checkpoint_ema
 
 from fvcore.nn import FlopCountAnalysis, flop_count_str, flop_count
@@ -37,9 +38,14 @@ from fvcore.nn import FlopCountAnalysis, flop_count_str, flop_count
 from timm.utils import ModelEma as ModelEma
 
 if torch.multiprocessing.get_start_method() != "spawn":
+    print(f"||{torch.multiprocessing.get_start_method()}||", end="")
     torch.multiprocessing.set_start_method("spawn", force=True)
 
 def str2bool(v):
+    """
+    Converts string to bool type; enables command line 
+    arguments in the format of '--arg1 true --arg2 false'
+    """
     if isinstance(v, bool):
         return v
     if v.lower() in ('yes', 'true', 't', 'y', '1'):
@@ -49,21 +55,34 @@ def str2bool(v):
     else:
         raise argparse.ArgumentTypeError('Boolean value expected.')
 
+
 def parse_option():
     parser = argparse.ArgumentParser('Swin Transformer training and evaluation script', add_help=False)
-    parser.add_argument('--cfg', type=str, metavar="FILE", default="", help='path to config file')
-    parser.add_argument("--opts", help="Modify config options by adding 'KEY VALUE' pairs.", default=None, nargs='+')
+    parser.add_argument('--cfg', type=str, metavar="FILE", default="", help='path to config file', )
+    parser.add_argument(
+        "--opts",
+        help="Modify config options by adding 'KEY VALUE' pairs. ",
+        default=None,
+        nargs='+',
+    )
+
+    # easy config modification
     parser.add_argument('--batch-size', type=int, help="batch size for single GPU")
     parser.add_argument('--data-path', type=str, default="/dataset/ImageNet_ILSVRC2012", help='path to dataset')
     parser.add_argument('--zip', action='store_true', help='use zipped dataset instead of folder dataset')
     parser.add_argument('--cache-mode', type=str, default='part', choices=['no', 'full', 'part'],
-                        help='no: no cache, full: cache all data, part: sharding the dataset into nonoverlapping pieces and only cache one piece')
-    parser.add_argument('--pretrained', help='pretrained weight from checkpoint, could be imagenet22k pretrained weight')
+                        help='no: no cache, '
+                             'full: cache all data, '
+                             'part: sharding the dataset into nonoverlapping pieces and only cache one piece')
+    parser.add_argument('--pretrained',
+                        help='pretrained weight from checkpoint, could be imagenet22k pretrained weight')
     parser.add_argument('--resume', help='resume from checkpoint')
     parser.add_argument('--accumulation-steps', type=int, help="gradient accumulation steps")
-    parser.add_argument('--use-checkpoint', action='store_true', help="whether to use gradient checkpointing to save memory")
+    parser.add_argument('--use-checkpoint', action='store_true',
+                        help="whether to use gradient checkpointing to save memory")
     parser.add_argument('--disable_amp', action='store_true', help='Disable pytorch amp')
-    parser.add_argument('--output', default='output', type=str, metavar='PATH', help='root of output folder')
+    parser.add_argument('--output', default='output', type=str, metavar='PATH',
+                        help='root of output folder, the full path is <output>/<model_name>/<tag> (default: output)')
     parser.add_argument('--tag', default=time.strftime("%Y%m%d%H%M%S", time.localtime()), help='tag of experiment')
     parser.add_argument('--eval', action='store_true', help='Perform evaluation only')
     parser.add_argument('--throughput', action='store_true', help='Test throughput only')
@@ -77,10 +96,7 @@ def parse_option():
     parser.add_argument('--model_ema_force_cpu', type=str2bool, default=False, help='')
 
     parser.add_argument('--memory_limit_rate', type=float, default=-1, help='limitation of gpu memory use')
-    # Environemnt
-    parser.add_argument('--local_rank', type=int, default=int(os.environ['LOCAL_RANK']), help='Local rank for distributed training')
-    parser.add_argument('--rank', type=int, default=0, help='')
-    parser.add_argument('--world_size', type=int, default=1, help='')
+
     args, unparsed = parser.parse_known_args()
 
     config = get_config(args)
@@ -88,38 +104,20 @@ def parse_option():
     return args, config
 
 
-def _torch_distributed_init_process_group(local_rank):
-    torch.distributed.init_process_group(backend="nccl", init_method="env://")
-    rank = torch.distributed.get_rank()
-    world_size = torch.distributed.get_world_size()
-    print(f"my rank={rank} local_rank={local_rank}")
-    torch.cuda.set_device(local_rank)
-    return {
-        "rank": rank,
-        "world_size": world_size,
-    }
-
-def set_up_env(args):
-    assert torch.cuda.is_available()
-    env_params = _torch_distributed_init_process_group(local_rank=args.local_rank)
-    args.rank = env_params["rank"]
-    args.world_size = env_params["world_size"]
-    args.device = torch.device("cuda")
-
-
 def main(config, args):
     dataset_train, dataset_val, data_loader_train, data_loader_val, mixup_fn = build_loader(config)
 
     logger.info(f"Creating model:{config.MODEL.TYPE}/{config.MODEL.NAME}")
     model = build_model(config)
+    model = model
 
     if dist.get_rank() == 0:
         if hasattr(model, 'flops'):
             logger.info(str(model))
             n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
             logger.info(f"number of params: {n_parameters}")
-            flops = model.flops()
-            logger.info(f"number of GFLOPs: {flops / 1e9}")
+            #flops = model.flops()
+            #logger.info(f"number of GFLOPs: {flops / 1e9}")
         else:
             logger.info(flop_count_str(FlopCountAnalysis(model, (dataset_val[0][0][None],))))
     torch.cuda.empty_cache()
@@ -139,7 +137,8 @@ def main(config, args):
 
 
     optimizer = build_optimizer(config, model, logger)
-    model = torch.nn.parallel.DistributedDataParallel(model, broadcast_buffers=False)
+    model = torch.nn.parallel.DistributedDataParallel(model, broadcast_buffers=False, find_unused_parameters=True)
+    model._set_static_graph()
     loss_scaler = NativeScalerWithGradNormCount()
 
     if config.TRAIN.ACCUMULATION_STEPS > 1:
@@ -227,7 +226,8 @@ def main(config, args):
     logger.info('Training time {}'.format(total_time_str))
 
 
-def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mixup_fn, lr_scheduler, loss_scaler, model_ema=None, model_time_warmup=50):
+def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mixup_fn, lr_scheduler, loss_scaler, model_ema=None, model_time_warmup=50, load_balance = 0.01):
+    torch.autograd.set_detect_anomaly(True)
     model.train()
     optimizer.zero_grad()
 
@@ -245,7 +245,6 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
         torch.cuda.reset_peak_memory_stats()
         samples = samples.cuda(non_blocking=True)
         targets = targets.cuda(non_blocking=True)
-
         if mixup_fn is not None:
             samples, targets = mixup_fn(samples, targets)
 
@@ -254,6 +253,18 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
         with torch.cuda.amp.autocast(enabled=config.AMP_ENABLE):
             outputs = model(samples)
         loss = criterion(outputs, targets)
+        
+        if load_balance > 0:
+            balance_loss = 0
+            for name, m in model.named_modules():
+                if isinstance(m, CustomNaiveGate_Balance_SMoE) or isinstance(
+                    m, CustomNaiveGate_Balance_XMoE
+                ):
+                    #print("balance loss: ", m.loss)
+                    if m.loss is not None:
+                        balance_loss += m.loss
+            loss += load_balance * balance_loss
+            
         loss = loss / config.TRAIN.ACCUMULATION_STEPS
 
         # this attribute is added by timm on one optimizer (adahessian)
@@ -369,11 +380,19 @@ def throughput(data_loader, model, logger):
 
 if __name__ == '__main__':
     args, config = parse_option()
-    set_up_env(args)
+
     if config.AMP_OPT_LEVEL:
         print("[warning] Apex amp has been deprecated, please use pytorch amp instead!")
 
-    torch.cuda.set_device(args.rank)
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ['WORLD_SIZE'])
+        print(f"RANK and WORLD_SIZE in environ: {rank}/{world_size}")
+    else:
+        rank = -1
+        world_size = -1
+    torch.cuda.set_device(rank)
+    dist.init_process_group(backend='nccl', init_method='env://', world_size=world_size, rank=rank)
     dist.barrier()
 
     seed = config.SEED + dist.get_rank()
@@ -426,7 +445,7 @@ if __name__ == '__main__':
 
     # print config
     logger.info(config.dump())
-    #logger.info(json.dumps(vars(args)))
+    logger.info(json.dumps(vars(args)))
 
     if args.memory_limit_rate > 0 and args.memory_limit_rate < 1:
         torch.cuda.set_per_process_memory_fraction(args.memory_limit_rate)
