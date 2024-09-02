@@ -316,6 +316,12 @@ class MOELinear(Function):
 
     @staticmethod
     def forward(ctx, global_input_buf, fwd_expert_count, weight, bias=None):
+        if global_input_buf.dtype != torch.float16:
+            global_input_buf = global_input_buf.half()
+        if weight.dtype != torch.float16:
+           weight = weight.half()
+        if bias is not None and bias.dtype != torch.float16:
+           bias = bias.half()
         global_output_buf = fmoe_cuda.linear_forward(
             global_input_buf, fwd_expert_count, weight, bias
         )
