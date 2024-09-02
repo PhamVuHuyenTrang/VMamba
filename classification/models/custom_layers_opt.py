@@ -60,7 +60,7 @@ def _fmoe_general_global_forward(
         fwd_expert_count,
         fwd_batch_size,
     ) = prepare_forward(gate, num_expert, world_size)
-    import pdb;pdb.set_trace()
+    #import pdb;pdb.set_trace()
     topk = 1
     if len(gate.shape) == 2:
         topk = gate.shape[1]
