@@ -155,14 +155,7 @@ class MOEGather(Function):
         local_batch_size,
         world_size,
     ):
-          # Debugging: Print the shapes and values before CUDA calls
-        print("global_output_buf shape:", global_output_buf.shape)
-        print("pos shape:", pos.shape)
-        print("local_expert_count:", local_expert_count)
-        print("global_expert_count:", global_expert_count)
-        print("Entering MOEGather.forward")
         if world_size > 1:
-            print("Before global_gather call")
             local_output_buf = fmoe_cuda.global_gather(
                 global_output_buf,
                 local_expert_count,
@@ -170,34 +163,23 @@ class MOEGather(Function):
                 pos.shape[0],
                 world_size,
             )
-            print("After global_gather call")
         else:
             local_output_buf = global_output_buf
-        # Debugging: Ensure pos is within bounds of local_output_buf
-        assert pos.min() >= 0, "pos contains negative indices!"
-        assert pos.max() < local_output_buf.size(0), "pos contains out-of-bounds indices!"
-        print("Before _local_gather call")
         output = _local_gather(
             local_output_buf, pos, local_batch_size, maybe_overlap=False
         )
-        print("After _local_gather call")
-        print("Bugs")
-        
+
         ctx.moe_args = (global_output_buf.shape[0], world_size)
         variables = (pos, local_expert_count, global_expert_count)
         ctx.save_for_backward(*variables)
-        print("Exiting MOEGather.forward")
         return output
 
     @staticmethod
     def backward(ctx, grad_out):
-        print("Entering MOEGather.backward")
-        exit()
         pos, local_expert_count, global_expert_count = ctx.saved_tensors
         fwd_batch_size, world_size = ctx.moe_args
         grad_out_buf = _local_scatter(grad_out.contiguous(), pos)
         if world_size > 1:
-            print("Before _local_scatter call")
             global_grad_out_buf = fmoe_cuda.global_scatter(
                 grad_out_buf,
                 local_expert_count,
@@ -207,7 +189,6 @@ class MOEGather(Function):
             )
         else:
             global_grad_out_buf = grad_out_buf
-        print("Exiting MOEGather.backward")
         return global_grad_out_buf, None, None, None, None, None
 
 
