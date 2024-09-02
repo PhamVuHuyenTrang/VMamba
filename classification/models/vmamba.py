@@ -115,6 +115,8 @@ class Mlp(nn.Module):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
+        #print("in_features", in_features)
+        #print("out_features", hidden_features)
         Linear = Linear2d if channels_first else nn.Linear
         self.fc1 = Linear(in_features, hidden_features)
         self.act = act_layer()
@@ -1212,6 +1214,7 @@ class VSSBlock(nn.Module):
         # =============================
         _SS2D: type = SS2D,
         MoE = True,
+        layer_idx = 0,
         **kwargs,
     ):
         super().__init__()
@@ -1250,16 +1253,22 @@ class VSSBlock(nn.Module):
         self.drop_path = DropPath(drop_path)
         
         if self.mlp_branch:
-            if MoE:
-                _MLP = MoE_vmamba if not gmlp else gMlp
+            if layer_idx == 0: 
+                if MoE == True:
+                    _MLP = MoE_vmamba
+                else:
+                    _MLP = Mlp if not gmlp else gMlp
+                self.norm2 = norm_layer(hidden_dim)
+                mlp_hidden_dim = int(hidden_dim * mlp_ratio)
+                if MoE:
+                    self.mlp = _MLP(in_features=hidden_dim, hidden_features=int(mlp_hidden_dim/2.), act_layer=mlp_act_layer, drop=mlp_drop_rate, channels_first=channel_first)
+                else:
+                    self.mlp = _MLP(in_features=hidden_dim, hidden_features=mlp_hidden_dim, act_layer=mlp_act_layer, drop=mlp_drop_rate, channels_first=channel_first)  
             else:
                 _MLP = Mlp if not gmlp else gMlp
-            self.norm2 = norm_layer(hidden_dim)
-            mlp_hidden_dim = int(hidden_dim * mlp_ratio)
-            if MoE:
+                self.norm2 = norm_layer(hidden_dim)
+                mlp_hidden_dim = int(hidden_dim * mlp_ratio)
                 self.mlp = _MLP(in_features=hidden_dim, hidden_features=int(mlp_hidden_dim/2.), act_layer=mlp_act_layer, drop=mlp_drop_rate, channels_first=channel_first)
-            else:
-                self.mlp = _MLP(in_features=hidden_dim, hidden_features=mlp_hidden_dim, act_layer=mlp_act_layer, drop=mlp_drop_rate, channels_first=channel_first)  
  
     def _forward(self, input: torch.Tensor):
         x = input
@@ -1325,6 +1334,7 @@ class VSSM(nn.Module):
         posembed=False,
         imgsize=224,
         _SS2D=SS2D,
+        MoE_schedule = 'light',
         # =========================
         **kwargs,
     ):
@@ -1379,7 +1389,7 @@ class VSSM(nn.Module):
                 norm_layer=norm_layer,
                 channel_first=self.channel_first,
             ) if (i_layer < self.num_layers - 1) else nn.Identity()
-
+            
             self.layers.append(self._make_layer(
                 dim = self.dims[i_layer],
                 drop_path = dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
@@ -1404,6 +1414,9 @@ class VSSM(nn.Module):
                 gmlp=gmlp,
                 # =================
                 _SS2D=_SS2D,
+                MoE_schedule = MoE_schedule,
+                layer_idx = i_layer,
+                
             ))
 
         self.classifier = nn.Sequential(OrderedDict(
@@ -1514,24 +1527,17 @@ class VSSM(nn.Module):
         # ===========================
         _SS2D=SS2D,
         MoE_schedule = 'strong',
+        layer_idx = 0,
         **kwargs,
     ):
         # if channel first, then Norm and Output are both channel_first
         depth = len(drop_path)
-        blocks = []
+        odd_blocks_idx = [i for i in range(depth) if i % 2 != 0]
+        blocks=[]
+        print("depth", depth)
         for d in range(depth):
             if MoE_schedule == 'light':
-                if (depth - 1) % 2 == 1:
-                    if d == depth - 1 or d == depth - 3:
-                        MoE = True
-                    else:
-                        MoE = False
-                else:
-                    if d == depth - 2 or d == depth - 4:
-                        MoE = True
-                    else:
-                        MoE = False
-    
+                MoE = (d in odd_blocks_idx[-2:]) 
                 blocks.append(VSSBlock(
                     hidden_dim=dim, 
                     drop_path=drop_path[d],
@@ -1553,8 +1559,9 @@ class VSSM(nn.Module):
                     use_checkpoint=use_checkpoint,
                     _SS2D=_SS2D,
                     MoE = MoE,
+                    layer_idx = layer_idx,
                 ))
-            if MoE_schedule == 'strong':
+            elif MoE_schedule == 'strong':
                 if d % 2 == 0:
                     MoE = False
                 else:
@@ -1581,9 +1588,9 @@ class VSSM(nn.Module):
                     use_checkpoint=use_checkpoint,
                     _SS2D=_SS2D,
                     MoE = MoE,
+                    layer_idx = layer_idx,
                 ))
-        
-        
+     
         return nn.Sequential(OrderedDict(
             blocks=nn.Sequential(*blocks,),
             downsample=downsample,
