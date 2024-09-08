@@ -5,17 +5,14 @@ import copy
 from functools import partial
 from typing import Optional, Callable, Any
 from collections import OrderedDict
-#from gate import *
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
-from models.moe import MoE
 from timm.models.layers import DropPath, trunc_normal_
 from fvcore.nn import FlopCountAnalysis, flop_count_str, flop_count, parameter_count
-from models.custom_ssm import *
-from models.moe_cuda import *
-from models.custom_gates import *
+
 DropPath.__repr__ = lambda self: f"timm.DropPath({self.drop_prob})"
 # train speed is slower after enabling this opts.
 # torch.backends.cudnn.enabled = True
@@ -115,8 +112,7 @@ class Mlp(nn.Module):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
-        #print("in_features", in_features)
-        #print("out_features", hidden_features)
+
         Linear = Linear2d if channels_first else nn.Linear
         self.fc1 = Linear(in_features, hidden_features)
         self.act = act_layer()
@@ -124,45 +120,14 @@ class Mlp(nn.Module):
         self.drop = nn.Dropout(drop)
 
     def forward(self, x):
-        #import pdb; pdb.set_trace()
         x = self.fc1(x)
         x = self.act(x)
         x = self.drop(x)
         x = self.fc2(x)
         x = self.drop(x)
         return x
-    
-class MoE_vmamba(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0., channels_first=False):
-        super().__init__()
-        #import pdb; pdb.set_trace()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        # code 2D MoE
-        self.fc1 = CustomizedMoEPositionwiseFF(gate=CustomNaiveGate_Balance_SMoE, hidden_size=in_features, inner_hidden_size=hidden_features, dropout=0.2)
-        #self.fc2 = CustomizedMoEPositionwiseFF(gate=CustomNaiveGate_Balance_SMoE, hidden_size=96, inner_hidden_size=hidden_size_experts, dropout=0.2)
-        self.act = act_layer()
-        self.drop = nn.Dropout(drop)
-    def forward(self, x):
-        #loss_balancing = 0
-        N, W, H, hidden_dim_inp = x.shape
-        #import pdb; pdb.set_trace()
-        x = torch.permute(x, (0, 3, 1, 2))
-        x = x.reshape(N, hidden_dim_inp, W * H)
-        x = torch.permute(x, (0, 2, 1))
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.drop(x)
-        #x = self.fc2(x)
-        #x = self.drop(x)
-        x = torch.permute(x, (0,2,1))
-        x = x.reshape(N, hidden_dim_inp, W, H)
-        x = torch.permute(x, (0,2,3,1))
-        #x = x.reshape(N, W, H, hidden_dim_inp)
-        #loss_balancing = loss_1.clone() + loss_2.clone()
-        return x
-        
-    
+
+
 class gMlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.,channels_first=False):
         super().__init__()
@@ -341,7 +306,6 @@ class SS2Dv0:
         x = self.in_proj(x)
         x, z = x.chunk(2, dim=-1) # (b, h, w, d)
         z = self.act(z)
-        #import pdb;pdb.set_trace()
         x = x.permute(0, 3, 1, 2).contiguous()
         x = self.conv2d(x) # (b, d, h, w)
         x = self.act(x)
@@ -403,7 +367,7 @@ class SS2Dv0:
         y = out_y[:, 0] + inv_y[:, 0] + wh_y + invwh_y
         
         y = y.transpose(dim0=1, dim1=2).contiguous() # (B, L, C)
-        y = self.out_norm(y.float()).view(B, H, W, -1)
+        y = self.out_norm(y).view(B, H, W, -1)
 
         y = y * z
         out = self.dropout(self.out_proj(y))
@@ -1213,8 +1177,6 @@ class VSSBlock(nn.Module):
         post_norm: bool = False,
         # =============================
         _SS2D: type = SS2D,
-        MoE = True,
-        layer_idx = 0,
         **kwargs,
     ):
         super().__init__()
@@ -1222,8 +1184,7 @@ class VSSBlock(nn.Module):
         self.mlp_branch = mlp_ratio > 0
         self.use_checkpoint = use_checkpoint
         self.post_norm = post_norm
-        #self.loss_balancing = 0.0
-        
+
         if self.ssm_branch:
             self.norm = norm_layer(hidden_dim)
             self.op = _SS2D(
@@ -1253,51 +1214,30 @@ class VSSBlock(nn.Module):
         self.drop_path = DropPath(drop_path)
         
         if self.mlp_branch:
-            if layer_idx == 0: 
-                if MoE == True:
-                    _MLP = MoE_vmamba
-                else:
-                    _MLP = Mlp if not gmlp else gMlp
-                self.norm2 = norm_layer(hidden_dim)
-                mlp_hidden_dim = int(hidden_dim * mlp_ratio)
-                if MoE:
-                    self.mlp = _MLP(in_features=hidden_dim, hidden_features=int(mlp_hidden_dim/2.), act_layer=mlp_act_layer, drop=mlp_drop_rate, channels_first=channel_first)
-                else:
-                    self.mlp = _MLP(in_features=hidden_dim, hidden_features=mlp_hidden_dim, act_layer=mlp_act_layer, drop=mlp_drop_rate, channels_first=channel_first)  
-            else:
-                _MLP = Mlp if not gmlp else gMlp
-                self.norm2 = norm_layer(hidden_dim)
-                mlp_hidden_dim = int(hidden_dim * mlp_ratio)
-                self.mlp = _MLP(in_features=hidden_dim, hidden_features=int(mlp_hidden_dim/2.), act_layer=mlp_act_layer, drop=mlp_drop_rate, channels_first=channel_first)
- 
+            _MLP = Mlp if not gmlp else gMlp
+            self.norm2 = norm_layer(hidden_dim)
+            mlp_hidden_dim = int(hidden_dim * mlp_ratio)
+            self.mlp = _MLP(in_features=hidden_dim, hidden_features=mlp_hidden_dim, act_layer=mlp_act_layer, drop=mlp_drop_rate, channels_first=channel_first)
+
     def _forward(self, input: torch.Tensor):
         x = input
-        
-        # Handle the SSM branch
         if self.ssm_branch:
             if self.post_norm:
                 x = x + self.drop_path(self.norm(self.op(x)))
             else:
                 x = x + self.drop_path(self.op(self.norm(x)))
-
-        # Handle the MLP branch
         if self.mlp_branch:
             if self.post_norm:
                 x = x + self.drop_path(self.norm2(self.mlp(x))) # FFN
-                
             else:
                 x = x + self.drop_path(self.mlp(self.norm2(x))) # FFN
-           
         return x
 
     def forward(self, input: torch.Tensor):
         if self.use_checkpoint:
-            x = checkpoint.checkpoint(self._forward, input)
+            return checkpoint.checkpoint(self._forward, input)
         else:
-            x = self._forward(input)
-        
-        return x
-
+            return self._forward(input)
 
 
 class VSSM(nn.Module):
@@ -1334,7 +1274,6 @@ class VSSM(nn.Module):
         posembed=False,
         imgsize=224,
         _SS2D=SS2D,
-        MoE_schedule = 'light',
         # =========================
         **kwargs,
     ):
@@ -1342,7 +1281,6 @@ class VSSM(nn.Module):
         self.channel_first = (norm_layer.lower() in ["bn", "ln2d"])
         self.num_classes = num_classes
         self.num_layers = len(depths)
-        #self.loss_balancing = 0
         if isinstance(dims, int):
             dims = [int(dims * 2 ** i_layer) for i_layer in range(self.num_layers)]
         self.num_features = dims[-1]
@@ -1389,7 +1327,7 @@ class VSSM(nn.Module):
                 norm_layer=norm_layer,
                 channel_first=self.channel_first,
             ) if (i_layer < self.num_layers - 1) else nn.Identity()
-            
+
             self.layers.append(self._make_layer(
                 dim = self.dims[i_layer],
                 drop_path = dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
@@ -1414,9 +1352,6 @@ class VSSM(nn.Module):
                 gmlp=gmlp,
                 # =================
                 _SS2D=_SS2D,
-                MoE_schedule = MoE_schedule,
-                layer_idx = i_layer,
-                
             ))
 
         self.classifier = nn.Sequential(OrderedDict(
@@ -1526,71 +1461,34 @@ class VSSM(nn.Module):
         gmlp=False,
         # ===========================
         _SS2D=SS2D,
-        MoE_schedule = 'strong',
-        layer_idx = 0,
         **kwargs,
     ):
         # if channel first, then Norm and Output are both channel_first
         depth = len(drop_path)
-        odd_blocks_idx = [i for i in range(depth) if i % 2 != 0]
-        blocks=[]
-        print("depth", depth)
+        blocks = []
         for d in range(depth):
-            if MoE_schedule == 'light':
-                MoE = (d in odd_blocks_idx[-2:]) 
-                blocks.append(VSSBlock(
-                    hidden_dim=dim, 
-                    drop_path=drop_path[d],
-                    norm_layer=norm_layer,
-                    channel_first=channel_first,
-                    ssm_d_state=ssm_d_state,
-                    ssm_ratio=ssm_ratio,
-                    ssm_dt_rank=ssm_dt_rank,
-                    ssm_act_layer=ssm_act_layer,
-                    ssm_conv=ssm_conv,
-                    ssm_conv_bias=ssm_conv_bias,
-                    ssm_drop_rate=ssm_drop_rate,
-                    ssm_init=ssm_init,
-                    forward_type=forward_type,
-                    mlp_ratio=mlp_ratio,
-                    mlp_act_layer=mlp_act_layer,
-                    mlp_drop_rate=mlp_drop_rate,
-                    gmlp=gmlp,
-                    use_checkpoint=use_checkpoint,
-                    _SS2D=_SS2D,
-                    MoE = MoE,
-                    layer_idx = layer_idx,
-                ))
-            elif MoE_schedule == 'strong':
-                if d % 2 == 0:
-                    MoE = False
-                else:
-                    MoE = True
-                    
-                blocks.append(VSSBlock(
-                    hidden_dim=dim, 
-                    drop_path=drop_path[d],
-                    norm_layer=norm_layer,
-                    channel_first=channel_first,
-                    ssm_d_state=ssm_d_state,
-                    ssm_ratio=ssm_ratio,
-                    ssm_dt_rank=ssm_dt_rank,
-                    ssm_act_layer=ssm_act_layer,
-                    ssm_conv=ssm_conv,
-                    ssm_conv_bias=ssm_conv_bias,
-                    ssm_drop_rate=ssm_drop_rate,
-                    ssm_init=ssm_init,
-                    forward_type=forward_type,
-                    mlp_ratio=mlp_ratio,
-                    mlp_act_layer=mlp_act_layer,
-                    mlp_drop_rate=mlp_drop_rate,
-                    gmlp=gmlp,
-                    use_checkpoint=use_checkpoint,
-                    _SS2D=_SS2D,
-                    MoE = MoE,
-                    layer_idx = layer_idx,
-                ))
-     
+            blocks.append(VSSBlock(
+                hidden_dim=dim, 
+                drop_path=drop_path[d],
+                norm_layer=norm_layer,
+                channel_first=channel_first,
+                ssm_d_state=ssm_d_state,
+                ssm_ratio=ssm_ratio,
+                ssm_dt_rank=ssm_dt_rank,
+                ssm_act_layer=ssm_act_layer,
+                ssm_conv=ssm_conv,
+                ssm_conv_bias=ssm_conv_bias,
+                ssm_drop_rate=ssm_drop_rate,
+                ssm_init=ssm_init,
+                forward_type=forward_type,
+                mlp_ratio=mlp_ratio,
+                mlp_act_layer=mlp_act_layer,
+                mlp_drop_rate=mlp_drop_rate,
+                gmlp=gmlp,
+                use_checkpoint=use_checkpoint,
+                _SS2D=_SS2D,
+            ))
+        
         return nn.Sequential(OrderedDict(
             blocks=nn.Sequential(*blocks,),
             downsample=downsample,
@@ -1603,7 +1501,6 @@ class VSSM(nn.Module):
             x = x + pos_embed
         for layer in self.layers:
             x = layer(x)
-            
         x = self.classifier(x)
         return x
 
@@ -1708,7 +1605,6 @@ class Backbone_VSSM(VSSM):
             print(f"Failed loading checkpoint form {ckpt}: {e}")
 
     def forward(self, x):
-        x = x
         def layer_forward(l, x):
             x = l.blocks(x)
             y = l.downsample(x)
@@ -1950,3 +1846,4 @@ if __name__ == "__main__":
     print(bench(model))
 
     breakpoint()
+
