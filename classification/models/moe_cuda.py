@@ -170,22 +170,28 @@ class CustomizedMoEPositionwiseFF(FMoESSMMLP):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, inp):
-        if self.pre_lnorm:
-            ##### layer normalization + positionwise feed-forward
-            core_out = super().forward(self.layer_norm(inp))
-            core_out = self.dropout(core_out)
+        N, hidden_dim_inp, W, H = inp.shape
+        inp = inp.reshape(N, hidden_dim_inp, W * H)
+        inp = torch.permute(inp, (0, 2, 1))
+        # if self.pre_lnorm:
+        #     ##### layer normalization + positionwise feed-forward
+        #     # core_out = super().forward(self.layer_norm(inp))
+        #     # core_out = self.dropout(core_out)
 
-            ##### residual connection
-            output = core_out + inp
-        else:
-            ##### positionwise feed-forward
-            core_out = super().forward(inp)
-            core_out = self.dropout(core_out)
+        #     ##### residual connection
+            
+        # else:
+            # ##### positionwise feed-forward
+            # core_out = super().forward(inp)
+            # core_out = self.dropout(core_out)
 
-            ##### residual connection + layer normalization
-            #import pdb;pdb.set_trace()
-            #output = self.layer_norm(inp + core_out)
-            output = self.layer_norm(inp + core_out)
+            # ##### residual connection + layer normalization
+            # #import pdb;pdb.set_trace()
+            # #output = self.layer_norm(inp + core_out)
+            # output = self.layer_norm(inp + core_out)
+        output = super().forward(inp)    
+        output = torch.permute(output, (0,2,1))
+        output = output.reshape(N, hidden_dim_inp, W, H)
         return output
 
 
@@ -231,17 +237,17 @@ class CustomizedMoEPositionwiseFFOpt(FMoESSMMLPOpt):
         if self.pre_lnorm:
             ##### layer normalization + positionwise feed-forward
             core_out = super().forward(self.layer_norm(inp))
-            core_out = self.dropout(core_out)
+            #core_out = self.dropout(core_out)
 
             ##### residual connection
-            output = core_out + inp
+            #output = core_out + inp
         else:
             ##### positionwise feed-forward
             core_out = super().forward(inp)
-            core_out = self.dropout(core_out)
+            #core_out = self.dropout(core_out)
 
             ##### residual connection + layer normalization
-            output = self.layer_norm(inp + core_out)
+            #output = self.layer_norm(inp + core_out)
 
         return output
 
