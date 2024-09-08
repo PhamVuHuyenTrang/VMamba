@@ -15,12 +15,17 @@ import argparse
 import datetime
 import tqdm
 import numpy as np
-
+import wandb
+from models.vmamba import Mlp
+from models.vmamba import VSSBlock
 import torch
 import torch.backends.cudnn as cudnn
+import torch.nn.functional as nn
 import torch.distributed as dist
 from models.custom_gates import *
-
+from models.custom_ssm import *
+from models.moe_cuda import *
+from models.custom_gates import *
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from timm.utils import accuracy, AverageMeter
 
@@ -96,6 +101,9 @@ def parse_option():
     parser.add_argument('--model_ema_force_cpu', type=str2bool, default=False, help='')
 
     parser.add_argument('--memory_limit_rate', type=float, default=-1, help='limitation of gpu memory use')
+    parser.add_argument('--wandb', type=str2bool, default=True, help='Use wandb for logging')  # Add wandb argument
+
+
 
     args, unparsed = parser.parse_known_args()
 
@@ -106,10 +114,37 @@ def parse_option():
 
 def main(config, args):
     dataset_train, dataset_val, data_loader_train, data_loader_val, mixup_fn = build_loader(config)
-
+    if args.wandb and dist.get_rank() == 0:
+        wandb.init(project="moe_vmamba", config=config, name='upcycling_8_experts_hidden_dims_1_perturbed_router_epsw1e-2_epsx5e-3')
+        #wandb.init(project="moe_vmamba", config=config, name='8_experts_hidden_dims_1_perturbed_router_epsw1e-2_epsx5e-3')
     logger.info(f"Creating model:{config.MODEL.TYPE}/{config.MODEL.NAME}")
+    checkpoint_path = '/home/ubuntu/trang/repo/VMamba/classification/vssm1_tiny_0230s_ckpt_epoch_264.pth'
+    checkpoint = torch.load(checkpoint_path)
     model = build_model(config)
-    model = model
+    model.load_state_dict(checkpoint['model'], strict=False)
+    for layer in model.layers:
+        for block_idx in range(len(layer[0])):
+            for name, module in layer[0][block_idx].named_children():
+                if isinstance(module, Mlp):
+                    fc1_layer = module.fc1
+                    fc2_layer = module.fc2
+                    in_features = fc1_layer.in_features
+                    mlp_dim = fc1_layer.out_features
+                    moe_layer = CustomizedMoEPositionwiseFF(
+                            gate=CustomNaiveGate_Balance_XMoE,
+                            hidden_size=in_features,
+                            inner_hidden_size=mlp_dim,
+                            dropout=0.2
+                        )
+                    experts_module = moe_layer.experts
+                    for i in range(experts_module.htoh4.num_expert):
+                        experts_module.htoh4.weight[i].data.copy_(fc1_layer.weight.data)
+                        experts_module.htoh4.bias[i].data.copy_(fc1_layer.bias.data)
+        
+                    for i in range(experts_module.h4toh.num_expert):
+                        experts_module.h4toh.weight[i].data.copy_(fc2_layer.weight.data)
+                        experts_module.h4toh.bias[i].data.copy_(fc2_layer.bias.data)
+                    setattr(layer[0][block_idx], name, moe_layer)
 
     if dist.get_rank() == 0:
         if hasattr(model, 'flops'):
@@ -203,14 +238,24 @@ def main(config, args):
 
     logger.info("Start training")
     start_time = time.time()
+    best_acc1 = 0.0
+    best_checkpoint_path = None
     for epoch in range(config.TRAIN.START_EPOCH, config.TRAIN.EPOCHS):
         data_loader_train.sampler.set_epoch(epoch)
 
         train_one_epoch(config, model, criterion, data_loader_train, optimizer, epoch, mixup_fn, lr_scheduler, loss_scaler, model_ema)
         if dist.get_rank() == 0 and (epoch % config.SAVE_FREQ == 0 or epoch == (config.TRAIN.EPOCHS - 1)):
-            save_checkpoint_ema(config, epoch, model_without_ddp, max_accuracy, optimizer, lr_scheduler, loss_scaler, logger, model_ema, max_accuracy_ema)
+            save_checkpoint_ema(config, epoch, model_without_ddp, max_accuracy, optimizer, lr_scheduler, loss_scaler, logger, model_ema, max_accuracy_ema,is_best = False)
 
         acc1, acc5, loss = validate(config, data_loader_val, model)
+        if acc1 > best_acc1:
+            best_acc1 = acc1
+            logger.info(f'New best accuracy: {best_acc1:.2f}%, saving best checkpoint.')
+            if best_checkpoint_path and os.path.exists(best_checkpoint_path):
+                os.remove(best_checkpoint_path)
+            if dist.get_rank() == 0:
+                best_checkpoint_path = save_checkpoint_ema(config, epoch, model_without_ddp, best_acc1, optimizer, lr_scheduler, loss_scaler, logger, model_ema, max_accuracy_ema,is_best = True)
+        logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
         logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
         max_accuracy = max(max_accuracy, acc1)
         logger.info(f'Max accuracy: {max_accuracy:.2f}%')
@@ -219,6 +264,8 @@ def main(config, args):
             logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1_ema:.1f}%")
             max_accuracy_ema = max(max_accuracy_ema, acc1_ema)
             logger.info(f'Max accuracy ema: {max_accuracy_ema:.2f}%')
+        if args.wandb and dist.get_rank() == 0:
+            wandb.log({'Epoch': epoch, 'Accuracy 1': acc1, 'Accuracy 5': acc5, 'Val Loss': loss})
 
 
     total_time = time.time() - start_time
@@ -287,7 +334,13 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
         scaler_meter.update(loss_scale_value)
         batch_time.update(time.time() - end)
         end = time.time()
-
+        if args.wandb and dist.get_rank() == 0:
+            wandb.log({
+                'Train Loss': loss_meter.avg,
+                'Learning Rate': optimizer.param_groups[0]["lr"],
+                'Batch Time': batch_time.avg,
+                'Epoch': epoch
+            })
         if idx > model_time_warmup:
             model_time.update(batch_time.val - data_time.val)
 
