@@ -8,6 +8,7 @@ from models.custom_functions import prepare_forward, ensure_comm
 from models.custom_functions import MOEScatter, MOEGather
 from models.custom_functions import AllGather, Slice
 from models.custom_gates import *
+from models.oft import get_weight_bias
 
 from models.fastermoe.config import switch_from_env
 
@@ -363,34 +364,33 @@ class FMoELinear(nn.Module):
         self.in_feat = in_feat
         self.out_feat = out_feat
         self.rank = rank
-        self.weight = nn.Parameter(torch.Tensor(num_expert, out_feat, in_feat))
+        self.weightOFT = nn.Parameter(torch.Tensor(num_expert, out_feat, in_feat))
         if bias:
-            self.bias = nn.Parameter(torch.zeros(num_expert, out_feat))
+            self.biasOFT = nn.Parameter(torch.zeros(num_expert, out_feat))
         else:
             self.register_parameter("bias", None)
-
-        self.reset_parameters()
 
     def forward(self, inp, fwd_expert_count):
         r"""
         Call MOE function
         """
+        weight_list = []
+        bias_list = []
+        for i in range(self.num_expert):
+            weight, bias = get_weight_bias(in_features = self.in_feat, OFT_weight = self.weightOFT[i, :, :], OFT_bias = self.biasOFT[i, :])
+            weight_list.append(weight)
+            bias_list.append(bias)
+        self.weight = torch.stack(weight_list)
+        self.bias = torch.stack(bias_list)
         x = MOELinear.apply(inp, fwd_expert_count, self.weight, self.bias)
         return x
 
-    def extra_repr(self) -> str:
-        return "num_expert={}, in_features={}, \
-        out_features={}, bias={}, rank={}".format(
-            self.num_expert,
-            self.in_feat,
-            self.out_feat,
-            self.bias is not None,
-            self.rank,
-        )
-
-    def reset_parameters(self):
-        # Approach is the same as in torch.nn.Linear
-        # https://github.com/pytorch/pytorch/blob/master/torch/nn/modules/linear.py#L88
-        # bias is left to zero, similar as megatron
-
-        torch.nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+    # def extra_repr(self) -> str:
+    #     return "num_expert={}, in_features={}, \
+    #     out_features={}, bias={}, rank={}".format(
+    #         self.num_expert,
+    #         self.in_feat,
+    #         self.out_feat,
+    #         self.bias is not None,
+    #         self.rank,
+    #     )
