@@ -29,7 +29,7 @@ from models.custom_gates import *
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from timm.utils import accuracy, AverageMeter
 import copy
-
+from oft import OFTInjectedLinear
 from config import get_config
 from models import build_model
 from data import build_loader
@@ -150,14 +150,14 @@ def main(config, args):
                     module_clone = layer_clone[0][block_idx].get_submodule(name)
                     fc1_layer_clone = module_clone.fc1
                     fc2_layer_clone = module_clone.fc2
-                        
+                    
                     for i in range(experts_module.htoh4.num_expert):
-                        experts_module.htoh4.weight[i].data.copy_(fc1_layer_clone.weight.data)
-                        experts_module.htoh4.bias[i].data.copy_(fc1_layer_clone.bias.data)
+                        experts_module.htoh4.weightOFT[i].data.copy_(fc1_layer_clone.weight.data)
+                        experts_module.htoh4.biasOFT[i].data.copy_(fc1_layer_clone.bias.data)
                         
                     for i in range(experts_module.h4toh.num_expert):
-                        experts_module.h4toh.weight[i].data.copy_(fc2_layer_clone.weight.data)
-                        experts_module.h4toh.bias[i].data.copy_(fc2_layer_clone.bias.data)
+                        experts_module.h4toh.weightOFT[i].data.copy_(fc2_layer_clone.weight.data)
+                        experts_module.h4toh.biasOFT[i].data.copy_(fc2_layer_clone.bias.data)
 
     if dist.get_rank() == 0:
         if hasattr(model, 'flops'):
