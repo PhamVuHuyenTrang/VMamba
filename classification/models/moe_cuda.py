@@ -171,27 +171,11 @@ class CustomizedMoEPositionwiseFF(FMoESSMMLP):
 
     def forward(self, inp):
         N, hidden_dim_inp, W, H = inp.shape
-        inp = inp.reshape(N, hidden_dim_inp, W * H)
-        inp = torch.permute(inp, (0, 2, 1))
-        # if self.pre_lnorm:
-        #     ##### layer normalization + positionwise feed-forward
-        #     # core_out = super().forward(self.layer_norm(inp))
-        #     # core_out = self.dropout(core_out)
-
-        #     ##### residual connection
-            
-        # else:
-            # ##### positionwise feed-forward
-            # core_out = super().forward(inp)
-            # core_out = self.dropout(core_out)
-
-            # ##### residual connection + layer normalization
-            # #import pdb;pdb.set_trace()
-            # #output = self.layer_norm(inp + core_out)
-            # output = self.layer_norm(inp + core_out)
+        inp = inp.contiguous().reshape(N, hidden_dim_inp, W * H)
+        inp = torch.permute(inp, (0, 2, 1)).contiguous()
         output = super().forward(inp)    
-        output = torch.permute(output, (0,2,1))
-        output = output.reshape(N, hidden_dim_inp, W, H)
+        output = torch.permute(output, (0,2,1)).contiguous()
+        output = output.contiguous().reshape(N, hidden_dim_inp, W, H)
         return output
 
 
