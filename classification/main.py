@@ -28,6 +28,7 @@ from models.moe_cuda import *
 from models.custom_gates import *
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from timm.utils import accuracy, AverageMeter
+import copy
 
 from config import get_config
 from models import build_model
@@ -101,7 +102,7 @@ def parse_option():
     parser.add_argument('--model_ema_force_cpu', type=str2bool, default=False, help='')
 
     parser.add_argument('--memory_limit_rate', type=float, default=-1, help='limitation of gpu memory use')
-    parser.add_argument('--wandb', type=str2bool, default=True, help='Use wandb for logging')  # Add wandb argument
+    parser.add_argument('--wandb', type=str2bool, default=False, help='Use wandb for logging')  # Add wandb argument
 
 
 
@@ -122,12 +123,13 @@ def main(config, args):
     checkpoint = torch.load(checkpoint_path)
     model = build_model(config)
     model.load_state_dict(checkpoint['model'], strict=False)
+    model_clone = copy.deepcopy(model)
+    
     for layer in model.layers:
         for block_idx in range(len(layer[0])):
             for name, module in layer[0][block_idx].named_children():
                 if isinstance(module, Mlp):
                     fc1_layer = module.fc1
-                    fc2_layer = module.fc2
                     in_features = fc1_layer.in_features
                     mlp_dim = fc1_layer.out_features
                     moe_layer = CustomizedMoEPositionwiseFF(
@@ -136,15 +138,26 @@ def main(config, args):
                             inner_hidden_size=mlp_dim,
                             dropout=0.2
                         )
-                    experts_module = moe_layer.experts
-                    for i in range(experts_module.htoh4.num_expert):
-                        experts_module.htoh4.weight[i].data.copy_(fc1_layer.weight.data)
-                        experts_module.htoh4.bias[i].data.copy_(fc1_layer.bias.data)
-        
-                    for i in range(experts_module.h4toh.num_expert):
-                        experts_module.h4toh.weight[i].data.copy_(fc2_layer.weight.data)
-                        experts_module.h4toh.bias[i].data.copy_(fc2_layer.bias.data)
+
                     setattr(layer[0][block_idx], name, moe_layer)
+
+    
+    for layer, layer_clone in zip(model.layers, model_clone.layers):
+        for block_idx in range(len(layer[0])):
+            for name, module in layer[0][block_idx].named_children():
+                if isinstance(module, CustomizedMoEPositionwiseFF):
+                    experts_module = module.experts
+                    module_clone = layer_clone[0][block_idx].get_submodule(name)
+                    fc1_layer_clone = module_clone.fc1
+                    fc2_layer_clone = module_clone.fc2
+                        
+                    for i in range(experts_module.htoh4.num_expert):
+                        experts_module.htoh4.weight[i].data.copy_(fc1_layer_clone.weight.data)
+                        experts_module.htoh4.bias[i].data.copy_(fc1_layer_clone.bias.data)
+                        
+                    for i in range(experts_module.h4toh.num_expert):
+                        experts_module.h4toh.weight[i].data.copy_(fc2_layer_clone.weight.data)
+                        experts_module.h4toh.bias[i].data.copy_(fc2_layer_clone.bias.data)
 
     if dist.get_rank() == 0:
         if hasattr(model, 'flops'):
@@ -297,7 +310,7 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
 
         data_time.update(time.time() - end)
 
-        with torch.cuda.amp.autocast(enabled=config.AMP_ENABLE):
+        with torch.amp.autocast('cuda', enabled=config.AMP_ENABLE):
             outputs = model(samples)
         loss = criterion(outputs, targets)
         
@@ -324,6 +337,8 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
             lr_scheduler.step_update((epoch * num_steps + idx) // config.TRAIN.ACCUMULATION_STEPS)
             if model_ema is not None:
                 model_ema.update(model)
+            # for layer in model.module.layers:
+            #     print("Gradient: ", layer[0][0].op.conv2d.weight.grad)
         loss_scale_value = loss_scaler.state_dict()["scale"]
 
         torch.cuda.synchronize()
@@ -379,7 +394,7 @@ def validate(config, data_loader, model):
         target = target.cuda(non_blocking=True)
 
         # compute output
-        with torch.cuda.amp.autocast(enabled=config.AMP_ENABLE):
+        with torch.amp.autocast('cuda', enabled=config.AMP_ENABLE):
             output = model(images)
 
         # measure accuracy and record loss
