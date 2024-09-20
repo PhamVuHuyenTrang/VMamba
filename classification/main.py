@@ -28,8 +28,7 @@ from models.moe_cuda import *
 from models.custom_gates import *
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from timm.utils import accuracy, AverageMeter
-import copy
-from oft import OFTInjectedLinear
+
 from config import get_config
 from models import build_model
 from data import build_loader
@@ -38,6 +37,7 @@ from utils.optimizer import build_optimizer
 from utils.logger import create_logger
 from utils.utils import  NativeScalerWithGradNormCount, auto_resume_helper, reduce_tensor
 from utils.utils import load_checkpoint_ema, load_pretrained_ema, save_checkpoint_ema
+from models.vmamba import MoE_vmamba
 
 from fvcore.nn import FlopCountAnalysis, flop_count_str, flop_count
 
@@ -102,7 +102,7 @@ def parse_option():
     parser.add_argument('--model_ema_force_cpu', type=str2bool, default=False, help='')
 
     parser.add_argument('--memory_limit_rate', type=float, default=-1, help='limitation of gpu memory use')
-    parser.add_argument('--wandb', type=str2bool, default=False, help='Use wandb for logging')  # Add wandb argument
+    parser.add_argument('--wandb', type=str2bool, default=True, help='Use wandb for logging')  # Add wandb argument
 
 
 
@@ -116,48 +116,99 @@ def parse_option():
 def main(config, args):
     dataset_train, dataset_val, data_loader_train, data_loader_val, mixup_fn = build_loader(config)
     if args.wandb and dist.get_rank() == 0:
-        wandb.init(project="moe_vmamba", config=config, name='upcycling_8_experts_hidden_dims_1_perturbed_router_epsw1e-2_epsx5e-3')
+        wandb.init(project="moe_vmamba", config=config, name='start_200_100epoches_loss_balancing0_1_lr_gate1e-3_lrparams_0.0002819_16experts_noise_std0.1_top_2_upcycling_perturbed_router_epsw1e-2_epsx5e-3')
         #wandb.init(project="moe_vmamba", config=config, name='8_experts_hidden_dims_1_perturbed_router_epsw1e-2_epsx5e-3')
     logger.info(f"Creating model:{config.MODEL.TYPE}/{config.MODEL.NAME}")
-    checkpoint_path = '/home/ubuntu/trang/repo/VMamba/classification/vssm1_tiny_0230s_ckpt_epoch_264.pth'
+    checkpoint_path = '/home/ubuntu/trang/repo/VMamba_baseline/VMamba/classification/vssm1_tiny_0230s/20240917082057/ckpt_epoch_200.pth'
     checkpoint = torch.load(checkpoint_path)
-    model = build_model(config)
-    model.load_state_dict(checkpoint['model'], strict=False)
-    model_clone = copy.deepcopy(model)
+    checkpoint_state_dict = checkpoint['model']
+
+    model, model_clone = build_model(config)
+    model_state_dict = model.state_dict()
+    common_keys = {k: v for k, v in checkpoint_state_dict.items() if k in model_state_dict}
+
+    # Debugging to check the common keys and their shapes
+    # print("Common keys with matching shapes:")
+    # for k in not_common_keys:
+    #     print(f"Layer: {k}, Checkpoint shape: {checkpoint_state_dict[k].shape}, Model shape: {model_state_dict[k].shape}")
+    # exit()
+    # Update model state dict with common keys that match in shape
+    model_state_dict.update(common_keys)
+
+    # Load the updated state dict into the model
+    model.load_state_dict(model_state_dict)
     
-    for layer in model.layers:
-        for block_idx in range(len(layer[0])):
-            for name, module in layer[0][block_idx].named_children():
-                if isinstance(module, Mlp):
-                    fc1_layer = module.fc1
-                    in_features = fc1_layer.in_features
-                    mlp_dim = fc1_layer.out_features
-                    moe_layer = CustomizedMoEPositionwiseFF(
-                            gate=CustomNaiveGate_Balance_XMoE,
-                            hidden_size=in_features,
-                            inner_hidden_size=mlp_dim,
-                            dropout=0.2
-                        )
-
-                    setattr(layer[0][block_idx], name, moe_layer)
-
+    mean = 0.0
+    std = 0.1
     
     for layer, layer_clone in zip(model.layers, model_clone.layers):
         for block_idx in range(len(layer[0])):
-            for name, module in layer[0][block_idx].named_children():
-                if isinstance(module, CustomizedMoEPositionwiseFF):
-                    experts_module = module.experts
-                    module_clone = layer_clone[0][block_idx].get_submodule(name)
-                    fc1_layer_clone = module_clone.fc1
-                    fc2_layer_clone = module_clone.fc2
-                    
-                    for i in range(experts_module.htoh4.num_expert):
-                        experts_module.htoh4.weightOFT[i].data.copy_(fc1_layer_clone.weight.data)
-                        experts_module.htoh4.biasOFT[i].data.copy_(fc1_layer_clone.bias.data)
-                        
-                    for i in range(experts_module.h4toh.num_expert):
-                        experts_module.h4toh.weightOFT[i].data.copy_(fc2_layer_clone.weight.data)
-                        experts_module.h4toh.biasOFT[i].data.copy_(fc2_layer_clone.bias.data)
+            if len(layer[0]) % 2 == 0:
+                if block_idx == len(layer[0]) - 1 or block_idx == len(layer[0]) - 3:
+                    for name, module in layer[0][block_idx].named_children():
+                        # print("Name")
+                        # print(name)
+                        # print("Module")
+                        # print(module)
+                        if isinstance(module, MoE_vmamba):
+                            experts_module = module.fc1.experts
+                            module_clone = layer_clone[0][block_idx].get_submodule(name)
+                            fc1_layer_clone = module_clone.fc1
+                            fc2_layer_clone = module_clone.fc2
+                            
+                            for i in range(experts_module.htoh4.num_expert):
+                                weight_noise = torch.randn_like(fc1_layer_clone.weight.data, device='cuda') * std + mean
+                                bias_noise = torch.randn_like(fc1_layer_clone.bias.data, device='cuda') * std + mean
+
+                                # Add noise to the weight and bias before copying
+                                noisy_weight = fc1_layer_clone.weight.data.to('cuda') + weight_noise
+                                noisy_bias = fc1_layer_clone.bias.data.to('cuda') + bias_noise
+
+                                experts_module.htoh4.weight[i].data.copy_(noisy_weight)
+                                experts_module.htoh4.bias[i].data.copy_(noisy_bias)
+                                
+                            for i in range(experts_module.h4toh.num_expert):
+                                weight_noise = torch.randn_like(fc2_layer_clone.weight.data, device='cuda') * std + mean
+                                bias_noise = torch.randn_like(fc2_layer_clone.bias.data, device='cuda') * std + mean
+
+                                # Add noise to the weight and bias before copying
+                                noisy_weight = fc2_layer_clone.weight.data.to('cuda') + weight_noise
+                                noisy_bias = fc2_layer_clone.bias.data.to('cuda') + bias_noise
+
+                                experts_module.h4toh.weight[i].data.copy_(noisy_weight)
+                                experts_module.h4toh.bias[i].data.copy_(noisy_bias)
+                                
+            else:
+                if block_idx == len(layer[0]) - 2 or block_idx == len(layer[0]) - 4:
+                    for name, module in layer[0][block_idx].named_children():
+                        if isinstance(module, MoE_vmamba):
+                            experts_module = module.fc1.experts
+                            module_clone = layer_clone[0][block_idx].get_submodule(name)
+                            fc1_layer_clone = module_clone.fc1
+                            fc2_layer_clone = module_clone.fc2
+                            
+                            for i in range(experts_module.htoh4.num_expert):
+                                weight_noise = torch.randn_like(fc1_layer_clone.weight.data, device='cuda') * std + mean
+                                bias_noise = torch.randn_like(fc1_layer_clone.bias.data, device='cuda') * std + mean
+
+                                # Add noise to the weight and bias before copying
+                                noisy_weight = fc1_layer_clone.weight.data.to('cuda') + weight_noise
+                                noisy_bias = fc1_layer_clone.bias.data.to('cuda') + bias_noise
+
+                                experts_module.htoh4.weight[i].data.copy_(noisy_weight)
+                                experts_module.htoh4.bias[i].data.copy_(noisy_bias)
+                                
+                            for i in range(experts_module.h4toh.num_expert):
+                                weight_noise = torch.randn_like(fc2_layer_clone.weight.data, device='cuda') * std + mean
+                                bias_noise = torch.randn_like(fc2_layer_clone.bias.data, device='cuda') * std + mean
+
+                                # Add noise to the weight and bias before copying
+                                noisy_weight = fc2_layer_clone.weight.data.to('cuda') + weight_noise
+                                noisy_bias = fc2_layer_clone.bias.data.to('cuda') + bias_noise
+
+                                experts_module.h4toh.weight[i].data.copy_(noisy_weight)
+                                experts_module.h4toh.bias[i].data.copy_(noisy_bias)
+                                               
 
     if dist.get_rank() == 0:
         if hasattr(model, 'flops'):
@@ -185,6 +236,27 @@ def main(config, args):
 
 
     optimizer = build_optimizer(config, model, logger)
+    # checkpoint_lr_scheduler = checkpoint['lr_scheduler']
+    # print("Keys in checkpoint_lr_scheduler:", checkpoint_lr_scheduler.keys())
+    # exit()
+    # checkpoint_optimizer_state = checkpoint['optimizer']
+    # new_optimizer_state = optimizer.state_dict()
+    # # Ensure the checkpoint has fewer parameter groups than the new optimizer
+    # num_groups_checkpoint = len(checkpoint_optimizer_state['param_groups'])
+    # num_groups_new = len(new_optimizer_state['param_groups'])
+
+    # # Copy the matching part from the checkpoint optimizer to the new optimizer
+    # for i in range(min(num_groups_checkpoint, num_groups_new)):
+    #     # Copy param group state from checkpoint to new optimizer
+    #     new_optimizer_state['param_groups'][i] = checkpoint_optimizer_state['param_groups'][i]
+        
+    #     # Update the state of each parameter in the matching param group
+    #     for param_id in checkpoint_optimizer_state['param_groups'][i]['params']:
+    #         new_optimizer_state['state'][param_id] = checkpoint_optimizer_state['state'][param_id]
+
+    # # Load the updated state into the optimizer
+    # optimizer.load_state_dict(new_optimizer_state)
+    # exit()
     model = torch.nn.parallel.DistributedDataParallel(model, broadcast_buffers=False, find_unused_parameters=True)
     model._set_static_graph()
     loss_scaler = NativeScalerWithGradNormCount()
@@ -310,7 +382,7 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
 
         data_time.update(time.time() - end)
 
-        with torch.amp.autocast('cuda', enabled=config.AMP_ENABLE):
+        with torch.cuda.amp.autocast(enabled=config.AMP_ENABLE):
             outputs = model(samples)
         loss = criterion(outputs, targets)
         
@@ -320,7 +392,8 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
                 if isinstance(m, CustomNaiveGate_Balance_SMoE) or isinstance(
                     m, CustomNaiveGate_Balance_XMoE
                 ):
-                    #print("balance loss: ", m.loss)
+                    # print("balance loss: ", m.loss)
+                    # exit()
                     if m.loss is not None:
                         balance_loss += m.loss
             loss += load_balance * balance_loss
@@ -337,8 +410,6 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
             lr_scheduler.step_update((epoch * num_steps + idx) // config.TRAIN.ACCUMULATION_STEPS)
             if model_ema is not None:
                 model_ema.update(model)
-            # for layer in model.module.layers:
-            #     print("Gradient: ", layer[0][0].op.conv2d.weight.grad)
         loss_scale_value = loss_scaler.state_dict()["scale"]
 
         torch.cuda.synchronize()
@@ -352,7 +423,8 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
         if args.wandb and dist.get_rank() == 0:
             wandb.log({
                 'Train Loss': loss_meter.avg,
-                'Learning Rate': optimizer.param_groups[0]["lr"],
+                'Learning Rate Normal params': optimizer.param_groups[0]["lr"],
+                'Learning Rate Gate': optimizer.param_groups[2]["lr"],
                 'Batch Time': batch_time.avg,
                 'Epoch': epoch
             })
@@ -360,8 +432,8 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
             model_time.update(batch_time.val - data_time.val)
 
         if idx % config.PRINT_FREQ == 0:
-            lr = optimizer.param_groups[0]['lr']
-            wd = optimizer.param_groups[0]['weight_decay']
+            lr = optimizer.param_groups[2]['lr']
+            wd = optimizer.param_groups[2]['weight_decay']
             memory_used = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
             etas = batch_time.avg * (num_steps - idx)
             logger.info(
@@ -394,7 +466,7 @@ def validate(config, data_loader, model):
         target = target.cuda(non_blocking=True)
 
         # compute output
-        with torch.amp.autocast('cuda', enabled=config.AMP_ENABLE):
+        with torch.cuda.amp.autocast(enabled=config.AMP_ENABLE):
             output = model(images)
 
         # measure accuracy and record loss
