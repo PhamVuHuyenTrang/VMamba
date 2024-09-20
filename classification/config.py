@@ -101,12 +101,12 @@ _C.MODEL.VSSM.GMLP = False
 # -----------------------------------------------------------------------------
 _C.TRAIN = CN()
 _C.TRAIN.START_EPOCH = 0
-_C.TRAIN.EPOCHS = 300
-_C.TRAIN.WARMUP_EPOCHS = 20
+_C.TRAIN.EPOCHS = 100
+_C.TRAIN.WARMUP_EPOCHS = 0
 _C.TRAIN.WEIGHT_DECAY = 0.05
 _C.TRAIN.BASE_LR = 5e-4
 _C.TRAIN.WARMUP_LR = 5e-7
-_C.TRAIN.MIN_LR = 5e-6
+_C.TRAIN.MIN_LR = 0.0
 # Clip gradient norm
 _C.TRAIN.CLIP_GRAD = 5.0
 # Auto resume from latest checkpoint
@@ -120,7 +120,7 @@ _C.TRAIN.USE_CHECKPOINT = False
 
 # LR scheduler
 _C.TRAIN.LR_SCHEDULER = CN()
-_C.TRAIN.LR_SCHEDULER.NAME = 'cosine'
+_C.TRAIN.LR_SCHEDULER.NAME = 'linear'
 # Epoch interval to decay LR, used in StepLRScheduler
 _C.TRAIN.LR_SCHEDULER.DECAY_EPOCHS = 30
 # LR decay rate, used in StepLRScheduler
@@ -200,7 +200,7 @@ _C.OUTPUT = ''
 # Tag of experiment, overwritten by command line argument
 _C.TAG = 'default'
 # Frequency to save checkpoint
-_C.SAVE_FREQ = 1
+_C.SAVE_FREQ = 40
 # Frequency to logging info
 _C.PRINT_FREQ = 10
 # Fixed random seed
