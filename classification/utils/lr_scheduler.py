@@ -40,7 +40,7 @@ def build_scheduler(config, optimizer, n_iter_per_epoch):
         lr_scheduler = LinearLRScheduler(
             optimizer,
             t_initial=num_steps,
-            lr_min_rate=0.01,
+            lr_min_rate=0.0,
             warmup_lr_init=config.TRAIN.WARMUP_LR,
             warmup_t=warmup_steps,
             t_in_epochs=False,
@@ -96,6 +96,7 @@ class LinearLRScheduler(Scheduler):
             super().update_groups(self.warmup_lr_init)
         else:
             self.warmup_steps = [1 for _ in self.base_values]
+        self.base_values = [0.0002819, 0.0002819, 1e-3]
 
     def _get_lr(self, t):
         if t < self.warmup_t:
