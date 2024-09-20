@@ -54,6 +54,9 @@ class CustomNaiveGate_Balance_SMoE(BaseGate):
             )
             gate_top_k_val = gate_top_k_val.view(-1, self.tot_expert)
         else:
+            # print("Gate")
+            # print("Gate shape", gate.shape)
+            #exit()
             gate_top_k_val, gate_top_k_idx = torch.topk(
                 gate, k=self.top_k, dim=-1, largest=True, sorted=False
             )  # [.. x top_k]
@@ -65,11 +68,13 @@ class CustomNaiveGate_Balance_SMoE(BaseGate):
 
         if return_all_scores:
             return gate_top_k_idx, gate_score, gate
+        # print(gate_score.shape)
+        # exit()
         return gate_top_k_idx, gate_score
 
 
 class CustomNaiveGate_Balance_XMoE(BaseGate):
-    def __init__(self, d_model, num_expert, world_size, top_k=2, g_balance=True):
+    def __init__(self, d_model, num_expert, world_size, top_k=2, g_balance=False):
         super().__init__(num_expert, world_size)
         self.gate = nn.Linear(d_model, self.tot_expert)
         self.top_k = top_k
@@ -108,12 +113,6 @@ class CustomNaiveGate_Balance_XMoE(BaseGate):
     def forward(self, inp, return_all_scores=False):
 
         reduced_inp = self.inp_reduction(inp)
-        with torch.no_grad():
-            expert_embeddings_norm = self.expert_embeddings.norm(
-                p=2.0, dim=1, keepdim=True
-            )
-            self.expert_embeddings.mul_(1.5 / expert_embeddings_norm)
-
         gate = self._cosine(reduced_inp, self.expert_embeddings)
         gate = self._make_finite(gate)
 
@@ -137,11 +136,14 @@ class CustomNaiveGate_Balance_XMoE(BaseGate):
             return gate_top_k_idx, gate_score, gate
         return gate_top_k_idx, gate_score
 
-    def _cosine(self, mat1, mat2, eps=1e-4):
+    def _cosine(self, mat1, mat2):
         assert mat1.dim() == 2
         assert mat2.dim() == 2
-        # mat1 = F.normalize(mat1, p=2.0, dim=1, eps=eps)
-        mat2 = F.normalize(mat2.float(), p=2.0, dim=1, eps=eps)
+        #device = mat1.device
+        eps1 = torch.ones_like(mat1) * 5e-3
+        eps2 = torch.ones_like(mat2) * 1e-2
+        mat1 = self._normalize(mat1.float(), p=2.0, dim=1, pertube_eps = eps1)
+        mat2 = self._normalize(mat2.float(), p=2.0, dim=1, pertube_eps = eps2)
         return mat1.float().matmul(mat2.transpose(0, 1)).type_as(mat1)
 
     def _make_finite(self, scores):
@@ -151,13 +153,19 @@ class CustomNaiveGate_Balance_XMoE(BaseGate):
             scores[~ok] = scores[ok].min()
         return scores
 
+    def _normalize(self, input, p: float = 2.0, dim: int = 1, pertube_eps = 1e-4):
+
+        denom = input.norm(p, dim, keepdim=True).expand_as(input) + pertube_eps
+        return input / denom
+
+
 
 class CustomNaiveGate_Balance_StableMoE(BaseGate):
     r"""
     Naive Gate StableMoE
     """
 
-    def __init__(self, d_model, num_expert, world_size, top_k=2, g_balance=True):
+    def __init__(self, d_model, num_expert, world_size, top_k=2, g_balance=False):
         super().__init__(num_expert, world_size)
         self.top_k = top_k
         self.dense_moe_flag = False
@@ -217,7 +225,11 @@ class CustomNaiveGate_Balance_StableMoE(BaseGate):
     def _cosine(self, mat1, mat2, eps=1e-4):
         assert mat1.dim() == 2
         assert mat2.dim() == 2
-        # mat1 = F.normalize(mat1, p=2.0, dim=1, eps=eps)
+        eps1 = torch.randn(1) * 1e-4
+        eps2 = torch.randn(1) * 1e-4
+        mat1 = mat1 + eps1
+        mat2 = mat2 + eps2
+        mat1 = F.normalize(mat1, p=2.0, dim=1, eps=eps)
         mat2 = F.normalize(mat2.float(), p=2.0, dim=1, eps=eps)
         return mat1.float().matmul(mat2.transpose(0, 1)).type_as(mat1)
 
