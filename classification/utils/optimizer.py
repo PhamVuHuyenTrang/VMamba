@@ -9,7 +9,10 @@
 
 from functools import partial
 from torch import optim as optim
-
+from models.custom_gates import *
+from models.custom_ssm import *
+from models.moe_cuda import *
+from models.custom_gates import *
 
 def build_optimizer(config, model, logger, simmim=False, is_pretrain=False, **kwargs):
     """
@@ -53,19 +56,34 @@ def set_weight_decay(model, skip_list=(), skip_keywords=()):
     has_decay = []
     no_decay = []
     no_decay_names = []
+    gate_params = []
 
+    # Loop through all parameters and decide if they should have weight decay
     for name, param in model.named_parameters():
         if not param.requires_grad:
-            continue  # frozen weights
+            continue  # Skip frozen weights
         if len(param.shape) == 1 or name.endswith(".bias") or (name in skip_list) or \
                 check_keywords_in_name(name, skip_keywords):
             no_decay.append(param)
             no_decay_names.append(name)
-            # print(f"{name} has no weight decay")
+        elif ".gate.expert_embeddings" in name:
+            gate_params.append(param)
         else:
             has_decay.append(param)
-    return [{'params': has_decay},
-            {'params': no_decay, 'weight_decay': 0.}], no_decay_names 
+            
+    # print("has_decay", has_decay)
+    # #print("no decay", no_decay)
+    # print("gate ", gate_names)
+    # print("has_decay_len", len(has_decay))
+    # # print("no decay_len", len(no_decay))
+    # print("gate len", len(gate_params))
+    # exit()
+    #Return parameter groups, including gate parameters with custom learning rate
+    return [
+        {'params': has_decay},  # Default weight decay
+        {'params': no_decay, 'weight_decay': 0.},  # No weight decay
+        {'params': gate_params, 'lr': 0.001}  # Custom learning rate for gate params
+    ], no_decay_names
 
 
 def check_keywords_in_name(name, keywords=()):
