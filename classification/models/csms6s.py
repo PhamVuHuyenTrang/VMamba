@@ -76,20 +76,18 @@ class SelectiveScanCuda(torch.autograd.Function):
         backend = "oflex" if WITH_SELECTIVESCAN_OFLEX and (backend is None) else backend
         backend = "core" if WITH_SELECTIVESCAN_CORE and (backend is None) else backend
         backend = "mamba" if WITH_SELECTIVESCAN_MAMBA and (backend is None) else backend
-        #backend = "oflex"
         ctx.backend = backend
         if backend == "oflex":
             out, x, *rest = selective_scan_cuda_oflex.fwd(u, delta, A, B, C, D, delta_bias, delta_softplus, 1, oflex)
         elif backend == "core":
             out, x, *rest = selective_scan_cuda_core.fwd(u, delta, A, B, C, D, delta_bias, delta_softplus, 1)
         elif backend == "mamba":
-            #import selective_scan_cuda
             out, x, *rest = selective_scan_cuda.fwd(u, delta, A, B, C, D, None, delta_bias, delta_softplus)
         ctx.save_for_backward(u, delta, A, B, C, D, delta_bias, x)
         return out
     
     @staticmethod
-    @torch.amp.custom_bwd(device_type='cuda')
+    @torch.cuda.amp.custom_bwd
     def backward(ctx, dout, *args):
         u, delta, A, B, C, D, delta_bias, x = ctx.saved_tensors
         backend = ctx.backend
@@ -265,4 +263,3 @@ if __name__ == "__main__":
         print(bench(lambda x: selective_scan_fn(x[0], x[1], x[2], x[3], x[4], x[5], x[6], True, backend="torch"), [(u, delta, As, Bs, Cs, Ds, delta_bias),]))
 
     check()
-
