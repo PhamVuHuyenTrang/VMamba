@@ -77,9 +77,6 @@ def cayley_batch( data):
 
     # Perform the Cayley parametrization
     Q = torch.bmm(I - skew, torch.inverse(I + skew))
-    print(I+skew)
-    exit()
-
     return Q
 
 def block_diagonal(R, r = 4, block_share = False):
