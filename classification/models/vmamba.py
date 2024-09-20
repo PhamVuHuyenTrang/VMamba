@@ -5,19 +5,23 @@ import copy
 from functools import partial
 from typing import Optional, Callable, Any
 from collections import OrderedDict
-
+#from gate import *
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from timm.models.layers import DropPath, trunc_normal_
 from fvcore.nn import FlopCountAnalysis, flop_count_str, flop_count, parameter_count
-
+from models.custom_ssm import *
+from models.moe_cuda import *
+from models.custom_gates import *
 DropPath.__repr__ = lambda self: f"timm.DropPath({self.drop_prob})"
 # train speed is slower after enabling this opts.
 # torch.backends.cudnn.enabled = True
 # torch.backends.cudnn.benchmark = True
 # torch.backends.cudnn.deterministic = True
+from concurrent.futures import ThreadPoolExecutor
+
 
 try:
     from .csm_triton import cross_scan_fn, cross_merge_fn
@@ -34,6 +38,119 @@ try:
     from .mamba2.ssd_minimal import selective_scan_chunk_fn
 except:
     from mamba2.ssd_minimal import selective_scan_chunk_fn
+
+
+# def reorder_tokens(inp, gate_top_k_idx, num_experts=32):
+#     batch_size, hidden_dim, height, width = inp.shape  # (batch_size, hidden_dim, height, width)
+#     num_tokens = height * width  # Total number of spatial tokens per image
+
+#     # Reshape the input to (batch_size, num_tokens, hidden_dim)
+#     inp_flat = inp.reshape(batch_size, hidden_dim, num_tokens).permute(0, 2, 1)  # (batch_size, num_tokens, hidden_dim)
+
+#     # Reshape gate_top_k_idx to (batch_size, num_tokens, top_k)
+#     gate_top_k_idx = gate_top_k_idx.view(batch_size, num_tokens, -1)
+
+#     # Create a mask for each expert (batch_size, num_tokens, num_experts)
+#     expert_indices = torch.arange(num_experts, device=inp.device).view(1, 1, num_experts)
+#     expert_mask = gate_top_k_idx.unsqueeze(-1) == expert_indices  # (batch_size, num_tokens, top_k, num_experts)
+
+#     # Reduce across the top_k dimension to get final mask (any token routed to an expert will be True)
+#     expert_mask = expert_mask.any(dim=-2)  # (batch_size, num_tokens, num_experts)
+
+#     # Create a sorting index for tokens based on expert routing
+#     expert_order = expert_mask.cumsum(dim=-1) * expert_mask
+#     expert_order_flat = expert_order.view(batch_size, num_tokens * num_experts)
+#     sorted_token_indices = expert_order_flat.argsort(dim=-1, stable=True)[:, :num_tokens]
+
+#     # Ensure indices are within the valid range
+#     sorted_token_indices = torch.clamp(sorted_token_indices, 0, num_tokens - 1)
+
+#     # Reorder tokens based on sorted indices
+#     sorted_token_indices_expanded = sorted_token_indices.unsqueeze(-1).expand(-1, -1, hidden_dim)
+#     reordered_inp_flat = torch.gather(inp_flat, 1, sorted_token_indices_expanded)
+
+#     # Reshape back to the original (batch_size, hidden_dim, height, width)
+#     reordered_inp = reordered_inp_flat.permute(0, 2, 1).reshape(batch_size, hidden_dim, height, width)
+
+#     return reordered_inp
+def reorder_tokens(inp, gate_top_k_idx, gate_score):
+    batch_size, hidden_dim, height, width = inp.shape  # (batch_size, hidden_dim, height, width)
+    num_tokens = height * width  # Total number of spatial tokens per image
+    num_experts = gate_top_k_idx.max() + 1  # Get the number of experts from gate_top_k_idx
+
+    # Reshape the input to (batch_size, num_tokens, hidden_dim)
+    inp_flat = inp.reshape(batch_size, hidden_dim, num_tokens).permute(0, 2, 1)  # (batch_size, num_tokens, hidden_dim)
+
+    # Reshape gate_top_k_idx and gate_score to (batch_size, num_tokens, top_k)
+    top_k = gate_top_k_idx.size(1)  # k is the number of top-k experts
+    gate_top_k_idx = gate_top_k_idx.view(batch_size, num_tokens, top_k)
+    gate_score = gate_score.view(batch_size, num_tokens, top_k)
+
+    # Create a mask for each expert (batch_size, num_tokens, top_k, num_experts)
+    expert_indices = torch.arange(num_experts, device=inp.device).view(1, 1, 1, num_experts)
+    expert_mask = gate_top_k_idx.unsqueeze(-2) == expert_indices  # (batch_size, num_tokens, top_k, num_experts)
+
+    # Sort tokens within each expert based on gate_score
+    sorted_scores, sort_indices = torch.sort(gate_score, dim=2, descending=True)  # (batch_size, num_tokens, top_k)
+    
+    # Gather sorted indices
+    sorted_indices = torch.gather(gate_top_k_idx, 2, sort_indices)  # (batch_size, num_tokens, top_k)
+    
+    # Flatten the sorted indices for reordering
+    sorted_indices_flat = sorted_indices.view(batch_size, num_tokens * top_k)
+
+    # Create a mask for the valid indices
+    valid_mask = expert_mask.view(batch_size, num_tokens * top_k, num_experts).any(dim=-1)
+    
+    # Create a cumulative count for ordering
+    cumulative_count = torch.cumsum(valid_mask.float(), dim=1).long()
+    
+    # Sort the tokens
+    sorted_token_indices = torch.gather(cumulative_count, 1, sorted_indices_flat)
+    
+    # Reorder tokens based on sorted indices
+    sorted_token_indices_expanded = sorted_token_indices.unsqueeze(-1).expand(-1, -1, hidden_dim)
+    reordered_inp_flat = torch.gather(inp_flat, 1, sorted_token_indices_expanded)
+
+    # Reshape back to the original (batch_size, hidden_dim, height, width)
+    reordered_inp = reordered_inp_flat.permute(0, 2, 1).reshape(batch_size, hidden_dim, height, width)
+
+    return reordered_inp
+
+
+# Parallel global_local//  Don't know whether it can work with multigpus or not?
+# ssm_layers is a list of SSMs (one for each expert)
+
+def mask_and_forward_no_loop(input, gate_top_k_idx, num_experts, ssm_layers):
+    batch_size, hidden_dim, H, W = input.shape
+
+    # Reshape gate_top_k_idx to (batch_size, H, W)
+    gate_top_k_idx = gate_top_k_idx.view(batch_size, H, W)
+
+    # Create mask for all experts at once (batch_size, hidden_dim, H, W, num_experts)
+    # Broadcasting gate_top_k_idx to match the number of experts
+    gate_top_k_idx_expanded = gate_top_k_idx.unsqueeze(1).expand(batch_size, hidden_dim, H, W)
+    expert_indices = torch.arange(num_experts).view(1, 1, 1, 1, num_experts).to(input.device)  # (1, 1, 1, 1, num_experts)
+
+    # Create masks for all experts at once: shape (batch_size, hidden_dim, H, W, num_experts)
+    masks = (gate_top_k_idx_expanded.unsqueeze(-1) == expert_indices).float()
+
+    # Expand input to match the mask for all experts: shape (batch_size, hidden_dim, H, W, num_experts)
+    expanded_input = input.unsqueeze(-1).expand(-1, -1, -1, -1, num_experts)
+
+    # Apply the masks to create masked inputs for each expert
+    masked_inputs = expanded_input * masks  # (batch_size, hidden_dim, H, W, num_experts)
+
+    # Parallel execution of SSM layers using ThreadPoolExecutor
+    def forward_ssm_parallel(expert_idx):
+        return ssm_layers[expert_idx](masked_inputs[..., expert_idx])
+
+    # Use ThreadPoolExecutor to process each SSM in parallel
+    with ThreadPoolExecutor(max_workers=num_experts) as executor:
+        ssm_outputs = list(executor.map(forward_ssm_parallel, range(num_experts)))
+
+    # Combine the outputs; each element in ssm_outputs corresponds to an SSM's result
+    return ssm_outputs
 
 
 # =====================================================
@@ -112,7 +229,8 @@ class Mlp(nn.Module):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
-
+        #print("in_features", in_features)
+        #print("out_features", hidden_features)
         Linear = Linear2d if channels_first else nn.Linear
         self.fc1 = Linear(in_features, hidden_features)
         self.act = act_layer()
@@ -120,14 +238,63 @@ class Mlp(nn.Module):
         self.drop = nn.Dropout(drop)
 
     def forward(self, x):
+        #import pdb; pdb.set_trace()
         x = self.fc1(x)
         x = self.act(x)
         x = self.drop(x)
         x = self.fc2(x)
         x = self.drop(x)
         return x
-
-
+    
+class MoE_vmamba(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0., channels_first=False, reorder = False):
+        super().__init__()
+        #import pdb; pdb.set_trace()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        # code 2D MoE
+        self.fc1 = CustomizedMoEPositionwiseFF(gate=CustomNaiveGate_Balance_SMoE, hidden_size=in_features, inner_hidden_size=hidden_features, dropout=0.2)
+        #self.fc2 = CustomizedMoEPositionwiseFF(gate=CustomNaiveGate_Balance_SMoE, hidden_size=96, inner_hidden_size=hidden_size_experts, dropout=0.2)
+        self.act = act_layer()
+        self.drop = nn.Dropout(drop)
+        self.reorder = reorder
+        self.channels_first = channels_first
+    def forward(self, x):
+        #loss_balancing = 0
+        N, W, H, hidden_dim_inp = x.shape
+        #import pdb; pdb.set_trace()
+        if self.channels_first:
+            N, hidden_dim_inp, W, H = x.shape
+            x = x.reshape(N, hidden_dim_inp, W * H)
+            x = torch.permute(x, (0, 2, 1))
+        else:
+            N, W, H, hidden_dim_inp = x.shape
+            x = torch.permute(x, (0, 3, 1, 2))
+            x = x.reshape(N, hidden_dim_inp, W * H)
+            x = torch.permute(x, (0, 2, 1))
+        if self.reorder:
+            x, gate_top_k_idx, gate_score = self.fc1(x)
+        else:
+            x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        #x = self.fc2(x)
+        #x = self.drop(x)
+        if self.channels_first:
+            x = torch.permute(x, (0,2,1))
+            x = x.reshape(N, hidden_dim_inp, W, H)
+        else:
+            x = torch.permute(x, (0,2,1))
+            x = x.reshape(N, hidden_dim_inp, W, H)
+            x = torch.permute(x, (0,2,3,1))
+        #x = x.reshape(N, W, H, hidden_dim_inp)
+        #loss_balancing = loss_1.clone() + loss_2.clone()
+        if self.reorder:
+            return x, gate_top_k_idx, gate_score
+        else:
+            return x
+        
+    
 class gMlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.,channels_first=False):
         super().__init__()
@@ -306,6 +473,7 @@ class SS2Dv0:
         x = self.in_proj(x)
         x, z = x.chunk(2, dim=-1) # (b, h, w, d)
         z = self.act(z)
+        #import pdb;pdb.set_trace()
         x = x.permute(0, 3, 1, 2).contiguous()
         x = self.conv2d(x) # (b, d, h, w)
         x = self.act(x)
@@ -367,7 +535,7 @@ class SS2Dv0:
         y = out_y[:, 0] + inv_y[:, 0] + wh_y + invwh_y
         
         y = y.transpose(dim0=1, dim1=2).contiguous() # (B, L, C)
-        y = self.out_norm(y).view(B, H, W, -1)
+        y = self.out_norm(y.float()).view(B, H, W, -1)
 
         y = y * z
         out = self.dropout(self.out_proj(y))
@@ -1177,14 +1345,23 @@ class VSSBlock(nn.Module):
         post_norm: bool = False,
         # =============================
         _SS2D: type = SS2D,
+        MoE = True,
+        layer_idx = 0,
+        clone = False,
+        reorder = False,
+        global_local = False,
         **kwargs,
     ):
         super().__init__()
         self.ssm_branch = ssm_ratio > 0
         self.mlp_branch = mlp_ratio > 0
         self.use_checkpoint = use_checkpoint
+        self.reorder = reorder
+        self.global_local = global_local
         self.post_norm = post_norm
-
+        self.MoE = MoE
+        #self.loss_balancing = 0.0
+        
         if self.ssm_branch:
             self.norm = norm_layer(hidden_dim)
             self.op = _SS2D(
@@ -1210,34 +1387,95 @@ class VSSBlock(nn.Module):
                 forward_type=forward_type,
                 channel_first=channel_first,
             )
-        
+        if self.global_local:
+            self.ssm_layers = nn.ModuleList([
+            _SS2D(
+                d_model=hidden_dim, 
+                d_state=ssm_d_state, 
+                ssm_ratio=ssm_ratio,
+                dt_rank=ssm_dt_rank,
+                act_layer=ssm_act_layer,
+                # ==========================
+                d_conv=ssm_conv,
+                conv_bias=ssm_conv_bias,
+                # ==========================
+                dropout=ssm_drop_rate,
+                # bias=False,
+                # ==========================
+                # dt_min=0.001,
+                # dt_max=0.1,
+                # dt_init="random",
+                # dt_scale="random",
+                # dt_init_floor=1e-4,
+                initialize=ssm_init,
+                # ==========================
+                forward_type=forward_type,
+                channel_first=channel_first,
+            ) for _ in range(32)
+        ])
         self.drop_path = DropPath(drop_path)
-        
         if self.mlp_branch:
-            _MLP = Mlp if not gmlp else gMlp
-            self.norm2 = norm_layer(hidden_dim)
-            mlp_hidden_dim = int(hidden_dim * mlp_ratio)
-            self.mlp = _MLP(in_features=hidden_dim, hidden_features=mlp_hidden_dim, act_layer=mlp_act_layer, drop=mlp_drop_rate, channels_first=channel_first)
-
+            if clone:
+                _MLP = Mlp if not gmlp else gMlp
+                self.norm2 = norm_layer(hidden_dim)
+                mlp_hidden_dim = int(hidden_dim * mlp_ratio)
+                self.mlp = _MLP(in_features=hidden_dim, hidden_features=mlp_hidden_dim, act_layer=mlp_act_layer, drop=mlp_drop_rate, channels_first=channel_first)
+            else:
+                if self.MoE:
+                    _MLP = MoE_vmamba
+                else:
+                    _MLP = Mlp if not gmlp else gMlp
+                self.norm2 = norm_layer(hidden_dim)
+                mlp_hidden_dim = int(hidden_dim * mlp_ratio)
+                if MoE:
+                    self.mlp = _MLP(in_features=hidden_dim, hidden_features=mlp_hidden_dim, act_layer=mlp_act_layer, drop=mlp_drop_rate, channels_first=channel_first, reorder = reorder)
+                else:
+                    self.mlp = _MLP(in_features=hidden_dim, hidden_features=mlp_hidden_dim, act_layer=mlp_act_layer, drop=mlp_drop_rate, channels_first=channel_first)  
+ 
     def _forward(self, input: torch.Tensor):
         x = input
+        
+        # Handle the SSM branch
         if self.ssm_branch:
             if self.post_norm:
                 x = x + self.drop_path(self.norm(self.op(x)))
             else:
                 x = x + self.drop_path(self.op(self.norm(x)))
+
+        # Handle the MLP branch
         if self.mlp_branch:
             if self.post_norm:
-                x = x + self.drop_path(self.norm2(self.mlp(x))) # FFN
+                if self.MoE:
+                    if self.reorder:
+                        x, gate_top_k_idx, gate_score = self.mlp(x)
+                        x = reorder_tokens(x, gate_top_k_idx=gate_top_k_idx, gate_score = gate_score)
+                        x = x + self.drop_path(self.norm2(x))
+                    else:
+                        x = x + self.drop_path(self.norm2(self.mlp(x))) 
+                else:
+                    x = x + self.drop_path(self.norm2(self.mlp(x))) # FFN
+                
             else:
-                x = x + self.drop_path(self.mlp(self.norm2(x))) # FFN
+                if self.MoE:
+                    if self.reorder:
+                        x, gate_top_k_idx, gate_score = self.mlp(self.norm2(x))
+                        x = reorder_tokens(x, gate_top_k_idx=gate_top_k_idx, gate_score = gate_score)
+                        x = x + self.drop_path(x)
+                    else:
+                        x = x + self.drop_path(self.mlp(self.norm2(x))) 
+                else:
+                    x = x + self.drop_path(self.mlp(self.norm2(x))) # FFN
+           
         return x
 
     def forward(self, input: torch.Tensor):
         if self.use_checkpoint:
-            return checkpoint.checkpoint(self._forward, input)
+            x = checkpoint.checkpoint(self._forward, input)
         else:
-            return self._forward(input)
+            x = self._forward(input)
+        
+        return x
+
 
 
 class VSSM(nn.Module):
@@ -1274,6 +1512,8 @@ class VSSM(nn.Module):
         posembed=False,
         imgsize=224,
         _SS2D=SS2D,
+        MoE_schedule = 'light',
+        clone = False,
         # =========================
         **kwargs,
     ):
@@ -1281,6 +1521,7 @@ class VSSM(nn.Module):
         self.channel_first = (norm_layer.lower() in ["bn", "ln2d"])
         self.num_classes = num_classes
         self.num_layers = len(depths)
+        #self.loss_balancing = 0
         if isinstance(dims, int):
             dims = [int(dims * 2 ** i_layer) for i_layer in range(self.num_layers)]
         self.num_features = dims[-1]
@@ -1327,7 +1568,7 @@ class VSSM(nn.Module):
                 norm_layer=norm_layer,
                 channel_first=self.channel_first,
             ) if (i_layer < self.num_layers - 1) else nn.Identity()
-
+            
             self.layers.append(self._make_layer(
                 dim = self.dims[i_layer],
                 drop_path = dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
@@ -1352,6 +1593,10 @@ class VSSM(nn.Module):
                 gmlp=gmlp,
                 # =================
                 _SS2D=_SS2D,
+                MoE_schedule = MoE_schedule,
+                layer_idx = i_layer,
+                clone = clone,
+                
             ))
 
         self.classifier = nn.Sequential(OrderedDict(
@@ -1461,34 +1706,73 @@ class VSSM(nn.Module):
         gmlp=False,
         # ===========================
         _SS2D=SS2D,
+        MoE_schedule = 'strong',
+        layer_idx = 0,
+        clone = False,
         **kwargs,
     ):
         # if channel first, then Norm and Output are both channel_first
         depth = len(drop_path)
-        blocks = []
+        odd_blocks_idx = [i for i in range(depth) if i % 2 != 0]
+        blocks=[]
+        # print("depth", depth)
         for d in range(depth):
-            blocks.append(VSSBlock(
-                hidden_dim=dim, 
-                drop_path=drop_path[d],
-                norm_layer=norm_layer,
-                channel_first=channel_first,
-                ssm_d_state=ssm_d_state,
-                ssm_ratio=ssm_ratio,
-                ssm_dt_rank=ssm_dt_rank,
-                ssm_act_layer=ssm_act_layer,
-                ssm_conv=ssm_conv,
-                ssm_conv_bias=ssm_conv_bias,
-                ssm_drop_rate=ssm_drop_rate,
-                ssm_init=ssm_init,
-                forward_type=forward_type,
-                mlp_ratio=mlp_ratio,
-                mlp_act_layer=mlp_act_layer,
-                mlp_drop_rate=mlp_drop_rate,
-                gmlp=gmlp,
-                use_checkpoint=use_checkpoint,
-                _SS2D=_SS2D,
-            ))
-        
+            if MoE_schedule == 'light':
+                MoE = (d in odd_blocks_idx[-2:]) 
+                blocks.append(VSSBlock(
+                    hidden_dim=dim, 
+                    drop_path=drop_path[d],
+                    norm_layer=norm_layer,
+                    channel_first=channel_first,
+                    ssm_d_state=ssm_d_state,
+                    ssm_ratio=ssm_ratio,
+                    ssm_dt_rank=ssm_dt_rank,
+                    ssm_act_layer=ssm_act_layer,
+                    ssm_conv=ssm_conv,
+                    ssm_conv_bias=ssm_conv_bias,
+                    ssm_drop_rate=ssm_drop_rate,
+                    ssm_init=ssm_init,
+                    forward_type=forward_type,
+                    mlp_ratio=mlp_ratio,
+                    mlp_act_layer=mlp_act_layer,
+                    mlp_drop_rate=mlp_drop_rate,
+                    gmlp=gmlp,
+                    use_checkpoint=use_checkpoint,
+                    _SS2D=_SS2D,
+                    MoE = MoE,
+                    layer_idx = layer_idx,
+                    clone = clone,
+                ))
+            elif MoE_schedule == 'strong':
+                if d % 2 == 0:
+                    MoE = False
+                else:
+                    MoE = True
+                    
+                blocks.append(VSSBlock(
+                    hidden_dim=dim, 
+                    drop_path=drop_path[d],
+                    norm_layer=norm_layer,
+                    channel_first=channel_first,
+                    ssm_d_state=ssm_d_state,
+                    ssm_ratio=ssm_ratio,
+                    ssm_dt_rank=ssm_dt_rank,
+                    ssm_act_layer=ssm_act_layer,
+                    ssm_conv=ssm_conv,
+                    ssm_conv_bias=ssm_conv_bias,
+                    ssm_drop_rate=ssm_drop_rate,
+                    ssm_init=ssm_init,
+                    forward_type=forward_type,
+                    mlp_ratio=mlp_ratio,
+                    mlp_act_layer=mlp_act_layer,
+                    mlp_drop_rate=mlp_drop_rate,
+                    gmlp=gmlp,
+                    use_checkpoint=use_checkpoint,
+                    _SS2D=_SS2D,
+                    MoE = MoE,
+                    layer_idx = layer_idx,
+                ))
+     
         return nn.Sequential(OrderedDict(
             blocks=nn.Sequential(*blocks,),
             downsample=downsample,
@@ -1501,6 +1785,7 @@ class VSSM(nn.Module):
             x = x + pos_embed
         for layer in self.layers:
             x = layer(x)
+            
         x = self.classifier(x)
         return x
 
@@ -1605,6 +1890,7 @@ class Backbone_VSSM(VSSM):
             print(f"Failed loading checkpoint form {ckpt}: {e}")
 
     def forward(self, x):
+        x = x
         def layer_forward(l, x):
             x = l.blocks(x)
             y = l.downsample(x)
@@ -1846,4 +2132,3 @@ if __name__ == "__main__":
     print(bench(model))
 
     breakpoint()
-
