@@ -155,6 +155,7 @@ class CustomizedMoEPositionwiseFF(FMoESSMMLP):
         pre_lnorm=False,
         moe_num_expert=8,
         moe_top_k=2,
+        reorder = False,
     ):
         activation = nn.Sequential(nn.ReLU(), nn.Dropout(dropout))
         super().__init__(
@@ -164,20 +165,20 @@ class CustomizedMoEPositionwiseFF(FMoESSMMLP):
             moe_top_k=moe_top_k,
             activation=activation,
             gate=gate,
+            reorder = reorder,
         )
         self.pre_lnorm = pre_lnorm
         self.layer_norm = nn.LayerNorm(hidden_size)
         self.dropout = nn.Dropout(dropout)
+        self.reorder = reorder
 
     def forward(self, inp):
-        N, hidden_dim_inp, W, H = inp.shape
-        inp = inp.contiguous().reshape(N, hidden_dim_inp, W * H)
-        inp = torch.permute(inp, (0, 2, 1)).contiguous()
-        output = super().forward(inp)    
-        output = torch.permute(output, (0,2,1)).contiguous()
-        output = output.contiguous().reshape(N, hidden_dim_inp, W, H)
-        return output
-
+        if self.reorder:
+            output, gate_top_k_idx, gate_score = super().forward(inp)
+            return output, gate_top_k_idx, gate_score
+        else:
+            output = super().forward(inp)
+            return output
 
 class CustomizedMoEPositionwiseFFOpt(FMoESSMMLPOpt):
     def __init__(
@@ -234,241 +235,3 @@ class CustomizedMoEPositionwiseFFOpt(FMoESSMMLPOpt):
             #output = self.layer_norm(inp + core_out)
 
         return output
-
-
-class TransformerSeqLayer(nn.Module):
-    def __init__(
-        self,
-        hidden_size,
-        inner_hidden_size,
-        dropout,
-        s,
-        g,
-        f,
-        gate_name,
-        optimal_policy,
-        moe_top_k,
-        freq,
-        alpha,
-        act_experts,
-        g_blance,
-        opt_blance,
-        combine_gate,
-        opt_loss,
-        **kargs,
-    ):
-        nn.Module.__init__(self)
-        if gate_name in ["smoe", "smoe-dropout"]:
-            gate = CustomNaiveGate_Balance_SMoE
-        elif gate_name == "xmoe":
-            gate = CustomNaiveGate_Balance_XMoE
-        elif gate_name == "stablemoe":
-            gate = CustomNaiveGate_Balance_StableMoE
-        else:
-            print(f"{gate_name} has not been implemented yet!")
-
-        self.attn = (
-            MultiHeadSeqAttention(hidden_size=hidden_size, dropout=dropout, **kargs)
-            if s is "s"
-            else None
-        )
-        if optimal_policy:
-            self.smoe = (
-                CustomizedMoEPositionwiseFFOpt(
-                    gate,
-                    hidden_size=hidden_size,
-                    inner_hidden_size=inner_hidden_size,
-                    dropout=dropout,
-                    moe_top_k=moe_top_k,
-                    freq=freq,
-                    alpha=alpha,
-                    act_experts=act_experts,
-                    g_blance=g_blance,
-                    opt_blance=opt_blance,
-                    combine_gate=combine_gate,
-                    opt_loss=opt_loss,
-                )
-                if g is "g"
-                else None
-            )
-        else:
-            self.smoe = (
-                CustomizedMoEPositionwiseFF(
-                    gate,
-                    hidden_size=hidden_size,
-                    inner_hidden_size=inner_hidden_size,
-                    dropout=dropout,
-                    moe_top_k=moe_top_k,
-                )
-                if g is "g"
-                else None
-            )
-
-        self.ff = (
-            FeedForwardLayer(
-                hidden_size=hidden_size,
-                inner_hidden_size=inner_hidden_size,
-                dropout=dropout,
-            )
-            if f is "f"
-            else None
-        )
-        self.norm1 = nn.LayerNorm(hidden_size)
-        self.norm2 = nn.LayerNorm(hidden_size)
-        self.norm3 = nn.LayerNorm(hidden_size)
-
-        self.use_attn = s == "s"
-        self.use_smoe = g == "g"
-        self.use_ff = f == "f"
-
-    def forward(self, h, h_cache, key_pe):
-        # h = B x M x H
-        # h_cache = B x L x H
-        if self.use_attn:
-            h_all = torch.cat([h_cache, h], dim=1)  # B x (M+L) x H
-            attn_out = self.attn(h, h_all, h_all, key_pe)
-            h = self.norm1(h + attn_out)  # B x M x H
-        if self.use_smoe:
-            smoe_out = self.smoe(h)
-            h = self.norm2(h + smoe_out)  # B x M x H
-        if self.use_ff:
-            ff_out = self.ff(h)
-            h = self.norm3(h + ff_out)  # B x M x H
-        return h
-
-
-class TransformerSeq(nn.Module):
-    def __init__(
-        self,
-        vocab_size,
-        hidden_size,
-        inner_hidden_size,
-        nb_heads,
-        nb_layers,
-        attn_span,
-        architecture,
-        base_arch,
-        gate_name,
-        optimal_policy,
-        dropout,
-        moe_top_k,
-        freq,
-        alpha,
-        act_experts,
-        g_blance,
-        opt_blance,
-        combine_gate,
-        opt_loss,
-        **kargs,
-    ):
-        nn.Module.__init__(self)
-        # token embeddings
-        self.in_emb = nn.Embedding(vocab_size, hidden_size)
-        self.out_emb = nn.Linear(hidden_size, vocab_size)
-        # position embeddings
-        self.key_pe = nn.Parameter(torch.randn(1, hidden_size // nb_heads, attn_span))
-
-        arch = architecture
-        print(arch)
-        self.attn_layer_count = arch.count("s")
-        self.layers = nn.ModuleList()
-        if base_arch == "transformer":
-            self.layers.extend(
-                TransformerSeqLayer(
-                    hidden_size=hidden_size,
-                    inner_hidden_size=inner_hidden_size,
-                    s=arch[2 * i],
-                    g=arch[2 * i + 1],
-                    f=None,
-                    gate_name=gate_name,
-                    optimal_policy=optimal_policy,
-                    nb_heads=nb_heads,
-                    dropout=dropout,
-                    moe_top_k=moe_top_k,
-                    freq=freq,
-                    alpha=alpha,
-                    act_experts=act_experts,
-                    g_blance=g_blance,
-                    opt_blance=opt_blance,
-                    combine_gate=combine_gate,
-                    opt_loss=opt_loss,
-                    attn_span=attn_span,
-                    **kargs,
-                )
-                for i in range(nb_layers)
-            )
-        elif base_arch == "glam":
-            for i in range(nb_layers):
-                self.layers.extend(
-                    [
-                        TransformerSeqLayer(
-                            hidden_size=hidden_size,
-                            inner_hidden_size=inner_hidden_size,
-                            s=arch[2 * i],
-                            g=arch[2 * i + 1],
-                            f=None,
-                            gate_name=gate_name,
-                            optimal_policy=optimal_policy,
-                            nb_heads=nb_heads,
-                            dropout=dropout,
-                            moe_top_k=moe_top_k,
-                            freq=freq,
-                            alpha=alpha,
-                            act_experts=act_experts,
-                            g_blance=g_blance,
-                            opt_blance=opt_blance,
-                            combine_gate=combine_gate,
-                            opt_loss=opt_loss,
-                            attn_span=attn_span,
-                            **kargs,
-                        ),
-                        TransformerSeqLayer(
-                            hidden_size=hidden_size,
-                            inner_hidden_size=inner_hidden_size,
-                            s=arch[2 * (i + 1)],
-                            g=None,
-                            f=arch[2 * (i + 1) + 1],
-                            gate_name=gate_name,
-                            optimal_policy=optimal_policy,
-                            nb_heads=nb_heads,
-                            dropout=dropout,
-                            moe_top_k=moe_top_k,
-                            freq=freq,
-                            alpha=alpha,
-                            act_experts=act_experts,
-                            g_blance=g_blance,
-                            opt_blance=opt_blance,
-                            combine_gate=combine_gate,
-                            opt_loss=opt_loss,
-                            attn_span=attn_span,
-                            **kargs,
-                        ),
-                    ]
-                )
-
-        else:
-            raise RuntimeError(
-                "wrong type of base architecture - must be 'transformer' or 'glam'"
-            )
-
-    def forward(self, x, h_cache):
-        # x size = B x M
-        block_size = x.size(1)
-        h = self.in_emb(x)  # B x M x H
-        h_cache_next = []
-        for l, layer in enumerate(self.layers):
-            if layer.use_attn:
-                cache_size = layer.attn.attn.get_cache_size()
-                if cache_size > block_size:
-                    h_cache_next_l = torch.cat(
-                        [h_cache[l][:, -cache_size + block_size :, :], h], dim=1
-                    ).detach()
-                else:
-                    h_cache_next_l = h[:, -cache_size:, :].detach()
-                h_cache_next.append(h_cache_next_l)
-                h = layer(h, h_cache[l], self.key_pe)  # B x M x H
-            else:
-                h = layer(h, [], self.key_pe)
-
-        out = F.log_softmax(self.out_emb(h), dim=-1)
-        return out, h_cache_next
