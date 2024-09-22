@@ -253,7 +253,7 @@ class MoE_vmamba(nn.Module):
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
         # code 2D MoE
-        self.fc1 = CustomizedMoEPositionwiseFF(gate=CustomNaiveGate_Balance_SMoE, hidden_size=in_features, inner_hidden_size=hidden_features, dropout=0.2)
+        self.fc1 = CustomizedMoEPositionwiseFF(gate=CustomNaiveGate_Balance_SMoE, hidden_size=in_features, inner_hidden_size=hidden_features, dropout=0.2, reorder = reorder)
         #self.fc2 = CustomizedMoEPositionwiseFF(gate=CustomNaiveGate_Balance_SMoE, hidden_size=96, inner_hidden_size=hidden_size_experts, dropout=0.2)
         self.act = act_layer()
         self.drop = nn.Dropout(drop)
@@ -1348,7 +1348,7 @@ class VSSBlock(nn.Module):
         MoE = True,
         layer_idx = 0,
         clone = False,
-        reorder = False,
+        reorder = True,
         global_local = False,
         **kwargs,
     ):
