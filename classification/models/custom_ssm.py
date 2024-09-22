@@ -48,15 +48,18 @@ class FMoESSMMLP(FMoE):
         expert_dp_comm="none",
         expert_rank=0,
         moe_top_k=2,
+        reorder = False,
         **kwargs
     ):
         super().__init__(
-            num_expert=num_expert, d_model=d_model, moe_top_k=moe_top_k, **kwargs
+            num_expert=num_expert, d_model=d_model, moe_top_k=moe_top_k, reorder = reorder, **kwargs
         )
         self.experts = _Expert(
             num_expert, d_model, d_hidden, activation, rank=expert_rank
         )
+        self.reorder = reorder
         self.mark_parallel_comm(expert_dp_comm)
+        self.reorder = reorder
 
     def forward(self, inp: torch.Tensor):
         r"""
@@ -64,10 +67,14 @@ class FMoESSMMLP(FMoE):
         normalization.
         """
         original_shape = inp.shape
+        # print("original_shape", original_shape)
         inp = inp.reshape(-1, self.d_model)
-        output = super().forward(inp)
-        return output.reshape(original_shape)
-
+        if self.reorder:
+            output, gate_top_k_idx, gate_score = super().forward(inp)
+            return output.reshape(original_shape), gate_top_k_idx, gate_score
+        else:
+            output = super().forward(inp)
+            return output.reshape(original_shape)
 
 class FMoESSMMLPOpt(FMoEOpt):
     r"""
